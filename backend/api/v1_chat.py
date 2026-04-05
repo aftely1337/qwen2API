@@ -7,6 +7,7 @@ import uuid
 from backend.services.qwen_client import QwenClient
 from backend.services.token_calc import calculate_usage
 from backend.services.tool_sieve import ToolSieve
+from backend.services.prompt_builder import build_prompt_with_tools
 
 log = logging.getLogger("qwen2api.chat")
 router = APIRouter()
@@ -36,11 +37,10 @@ async def chat_completions(request: Request):
     from backend.core.config import resolve_model
     model = resolve_model(body.get("model", "gpt-3.5-turbo"))
     messages = body.get("messages", [])
+    tools = body.get("tools", [])
     
-    content = ""
-    for m in messages:
-        if m.get("role") == "user":
-            content += m.get("content", "") + "\n"
+    # 构建带指令劫持的 Prompt
+    content = build_prompt_with_tools(messages, tools)
             
     # 无感重试调用
     try:

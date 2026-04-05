@@ -5,6 +5,7 @@ import logging
 import asyncio
 from backend.services.qwen_client import QwenClient
 from backend.services.token_calc import calculate_usage
+from backend.services.prompt_builder import build_prompt_with_tools
 from backend.core.config import resolve_model
 
 log = logging.getLogger("qwen2api.anthropic")
@@ -32,11 +33,23 @@ async def anthropic_messages(request: Request):
     body = await request.json()
     model = resolve_model(body.get("model", "claude-3-5-sonnet"))
     messages = body.get("messages", [])
+    tools = body.get("tools", [])
     
-    content = ""
+    # 构造兼容 OpenAI 的消息格式给 Prompt builder
+    system_text = body.get("system", "")
+    oai_msgs = []
+    if system_text:
+        oai_msgs.append({"role": "system", "content": system_text})
     for m in messages:
-        if m.get("role") == "user":
-            content += str(m.get("content", "")) + "\n"
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        # 处理 Claude 特有的数组形式
+        if isinstance(content, list):
+            text_blocks = [blk.get("text", "") for blk in content if blk.get("type") == "text"]
+            content = "\n".join(text_blocks)
+        oai_msgs.append({"role": role, "content": content})
+        
+    content = build_prompt_with_tools(oai_msgs, tools)
             
     try:
         events, chat_id, acc = await client.chat_stream_events_with_retry(model, content)
