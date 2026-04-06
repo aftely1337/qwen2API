@@ -142,6 +142,45 @@ async def verify_account(email: str, request: Request):
 
 @router.delete("/accounts/{email}", dependencies=[Depends(verify_admin)])
 async def delete_account(email: str, request: Request):
-    pool: AccountPool = request.app.state.account_pool
-    await pool.remove(email)
-    return {"status": "success"}
+    from backend.core.store import store
+    store.remove(email)
+    return {"ok": True}
+
+@router.get("/settings", dependencies=[Depends(verify_admin)])
+async def get_settings():
+    from backend.core.config import MODEL_MAP, VERSION
+    return {
+        "version": VERSION,
+        "max_inflight_per_account": settings.MAX_INFLIGHT_PER_ACCOUNT,
+        "model_aliases": MODEL_MAP
+    }
+
+@router.put("/settings", dependencies=[Depends(verify_admin)])
+async def update_settings(data: dict):
+    from backend.core.config import MODEL_MAP
+    if "max_inflight_per_account" in data:
+        settings.MAX_INFLIGHT_PER_ACCOUNT = data["max_inflight_per_account"]
+    if "model_aliases" in data:
+        MODEL_MAP.clear()
+        MODEL_MAP.update(data["model_aliases"])
+    return {"ok": True}
+
+@router.get("/keys", dependencies=[Depends(verify_admin)])
+async def get_keys():
+    from backend.core.config import API_KEYS
+    return {"keys": list(API_KEYS)}
+
+@router.post("/keys", dependencies=[Depends(verify_admin)])
+async def generate_key():
+    from backend.core.config import API_KEYS
+    import uuid
+    new_key = f"sk-qwen-{uuid.uuid4().hex[:20]}"
+    API_KEYS.add(new_key)
+    return {"ok": True, "key": new_key}
+
+@router.delete("/keys/{key}", dependencies=[Depends(verify_admin)])
+async def delete_key(key: str):
+    from backend.core.config import API_KEYS
+    if key in API_KEYS:
+        API_KEYS.remove(key)
+    return {"ok": True}

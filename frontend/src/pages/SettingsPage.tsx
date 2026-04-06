@@ -7,6 +7,8 @@ import { getAuthHeader } from "../lib/auth"
 export default function SettingsPage() {
   const [settings, setSettings] = useState<any>(null)
   const [sessionKey, setSessionKey] = useState("")
+  const [maxInflight, setMaxInflight] = useState(2)
+  const [modelAliases, setModelAliases] = useState("")
   
   const loadSessionKey = () => {
     setSessionKey(localStorage.getItem('qwen2api_key') || "")
@@ -18,7 +20,11 @@ export default function SettingsPage() {
         if(!res.ok) throw new Error("Unauthorized")
         return res.json()
       })
-      .then(data => setSettings(data))
+      .then(data => {
+        setSettings(data)
+        setMaxInflight(data.max_inflight_per_account || 2)
+        setModelAliases(JSON.stringify(data.model_aliases || {}, null, 2))
+      })
       .catch(() => toast.error("配置获取失败，请检查会话 Key"))
   }
 
@@ -43,13 +49,58 @@ export default function SettingsPage() {
     toast.success("Key 已清除")
   }
 
-  const curlExample = `curl http://localhost:8080/v1/chat/completions \\
+  const handleSaveConcurrency = () => {
+    fetch("http://localhost:8080/api/admin/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", ...getAuthHeader() },
+      body: JSON.stringify({ max_inflight_per_account: Number(maxInflight) })
+    }).then(res => {
+      if(res.ok) { toast.success("并发配置已保存"); fetchSettings(); }
+      else toast.error("保存失败")
+    })
+  }
+
+  const handleSaveAliases = () => {
+    try {
+      const parsed = JSON.parse(modelAliases)
+      fetch("http://localhost:8080/api/admin/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", ...getAuthHeader() },
+        body: JSON.stringify({ model_aliases: parsed })
+      }).then(res => {
+        if(res.ok) { toast.success("模型映射规则已更新"); fetchSettings(); }
+        else toast.error("保存失败")
+      })
+    } catch(e) {
+      toast.error("JSON 格式错误，请检查语法")
+    }
+  }
+
+  const curlExample = `# 流式对话
+curl http://localhost:8080/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -H "Authorization: Bearer \${YOUR_API_KEY}" \\
+  -H "Authorization: Bearer YOUR_API_KEY" \\
   -d '{
     "model": "qwen3.6-plus",
     "messages": [{"role": "user", "content": "你好"}],
     "stream": true
+  }'
+
+# Anthropic 格式
+curl http://localhost:8080/anthropic/v1/messages \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer YOUR_API_KEY" \\
+  -d '{
+    "model": "qwen3.6-plus",
+    "messages": [{"role": "user", "content": "你好"}]
+  }'
+
+# Gemini 格式
+curl http://localhost:8080/v1beta/models/qwen3.6-plus:generateContent \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer YOUR_API_KEY" \\
+  -d '{
+    "contents": [{"parts": [{"text": "你好"}]}]
   }'`
 
   return (
@@ -126,7 +177,17 @@ export default function SettingsPage() {
                 <span className="text-sm font-medium">单账号最大并发 (max_inflight)</span>
                 <p className="text-xs text-muted-foreground">控制每个上游账号同时处理的请求数量，避免被封禁。</p>
               </div>
-              <span className="font-mono text-sm bg-secondary px-2 py-1 rounded">{settings?.max_inflight_per_account || 2}</span>
+              <div className="flex gap-2 items-center">
+                <input 
+                  type="number" 
+                  min="1" 
+                  max="10" 
+                  value={maxInflight} 
+                  onChange={e => setMaxInflight(Number(e.target.value))}
+                  className="flex h-8 w-20 rounded-md border border-input bg-background px-3 py-1 text-sm text-center"
+                />
+                <Button size="sm" onClick={handleSaveConcurrency}>保存</Button>
+              </div>
             </div>
           </div>
         </div>
@@ -135,29 +196,18 @@ export default function SettingsPage() {
         <div className="rounded-xl border bg-card text-card-foreground shadow-sm">
           <div className="flex flex-col space-y-1.5 p-6 border-b bg-muted/30">
             <h3 className="font-semibold leading-none tracking-tight">自动模型映射规则 (Model Aliases)</h3>
-            <p className="text-sm text-muted-foreground">下游传入的模型名称将被网关自动路由至以下千问实际模型。</p>
+            <p className="text-sm text-muted-foreground">下游传入的模型名称将被网关自动路由至以下千问实际模型。请使用标准 JSON 格式编辑。</p>
           </div>
-          <div className="p-0">
-            <table className="w-full text-sm">
-              <thead className="bg-muted/50 border-b text-muted-foreground text-left">
-                <tr>
-                  <th className="h-10 px-6 font-medium w-1/2">客户端请求模型</th>
-                  <th className="h-10 px-6 font-medium w-1/2">实际映射目标</th>
-                </tr>
-              </thead>
-              <tbody>
-                {settings?.model_aliases ? Object.entries(settings.model_aliases).map(([alias, target]: [string, any]) => (
-                  <tr key={alias} className="border-b last:border-0 hover:bg-muted/30 transition-colors">
-                    <td className="px-6 py-3 font-mono text-xs text-primary">{alias}</td>
-                    <td className="px-6 py-3 font-mono text-xs text-muted-foreground">{target}</td>
-                  </tr>
-                )) : (
-                  <tr>
-                    <td colSpan={2} className="px-6 py-8 text-center text-muted-foreground">加载中...</td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
+          <div className="p-6">
+            <textarea 
+              rows={8}
+              value={modelAliases}
+              onChange={e => setModelAliases(e.target.value)}
+              className="flex min-h-[160px] w-full rounded-md border border-input bg-slate-950 text-slate-300 px-3 py-2 text-sm font-mono"
+            />
+            <div className="mt-4 flex justify-end">
+              <Button onClick={handleSaveAliases}>保存映射</Button>
+            </div>
           </div>
         </div>
 
