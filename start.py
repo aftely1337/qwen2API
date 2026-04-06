@@ -57,9 +57,8 @@ def check_and_install_dependencies():
     print("⚡ [系统预检] 正在扫描前端王座的 Node 环境...")
     is_windows = (os.name == "nt")
     npm_install_cmd = "npm install" if is_windows else ["npm", "install"]
-    npm_build_cmd = "npm run build" if is_windows else ["npm", "run", "build"]
     
-    # 检查前端 node_modules 是否存在，如果不存在或为了安全起见，执行 npm install 和 build
+    # 检查前端 node_modules 是否存在，如果不存在或为了安全起见，执行 npm install
     try:
         # 为了给用户一个清晰的进度，不吞噬这里的输出
         print("  -> 正在执行 npm install (可能需要一点时间，请耐心等待)...")
@@ -70,22 +69,7 @@ def check_and_install_dependencies():
             stdout=None, # 将 npm install 的日志也直接输出到终端，让你能看到为什么 npm 失败
             stderr=subprocess.STDOUT
         )
-        
-        print("  -> 正在强制清空旧版静态缓存并执行 npm run build 构建新资源...")
-        # 跨平台强制清空 dist 目录，防止 Vite 复用旧的 index.html
-        import shutil
-        dist_dir = FRONTEND_DIR / "dist"
-        if dist_dir.exists():
-            shutil.rmtree(dist_dir)
-            
-        subprocess.check_call(
-            npm_build_cmd,
-            cwd=FRONTEND_DIR,
-            shell=is_windows,
-            stdout=None, 
-            stderr=subprocess.STDOUT
-        )
-        print("✓ [预检通过] 前端依赖及构建已就绪。")
+        print("✓ [预检通过] 前端依赖已就绪。")
     except subprocess.CalledProcessError as e:
         print(f"❌ [预检失败] 前端构建失败: {e}")
         sys.exit(1)
@@ -111,39 +95,65 @@ def start_backend() -> subprocess.Popen:
     print(f"✓ Backend 已点火 (PID: {proc.pid}) -> 日志: logs/backend.log")
     return proc
 
+def start_frontend() -> subprocess.Popen:
+    print("⚡ 正在唤醒前端面板 (Admin Dashboard)...")
+    log_file = open(LOGS_DIR / "frontend.log", "w", encoding="utf-8")
+    
+    is_windows = (os.name == "nt")
+    npm_cmd = "npm run dev" if is_windows else ["npm", "run", "dev"]
+    
+    proc = subprocess.Popen(
+        npm_cmd,
+        cwd=FRONTEND_DIR,
+        shell=is_windows, 
+        stdout=None, # 将输出直接抛到终端
+        stderr=None
+    )
+    print(f"✓ Frontend 已点火 (PID: {proc.pid}) -> 终端直出报错")
+    return proc
+
 def main():
     ensure_dirs()
     check_and_install_dependencies()
     
     backend_proc = start_backend()
+    time.sleep(2) # 稍微错开启动时间
+    frontend_proc = start_frontend()
     
     print("\n==========================================")
-    print("帝国已上线。")
-    print("▶ 统一中枢入口: http://localhost:8080")
+    print("系统已上线。")
+    print("▶ 控制台入口: http://localhost:5173")
+    print("▶ API 接口:   http://localhost:8080")
     print("==========================================")
     print("按 Ctrl+C 掐断进程并关闭系统。")
     
     def signal_handler(sig, frame):
         print("\n\n⚠ 收到关闭指令，正在掐断进程...")
         backend_proc.terminate()
+        frontend_proc.terminate()
         backend_proc.wait()
-        print("✓ 进程已被摧毁，帝国下线。")
+        frontend_proc.wait()
+        print("✓ 进程已被摧毁，系统下线。")
         sys.exit(0)
         
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # 保持主进程存活，同时监控后端状态
+    # 保持主进程存活，同时监控状态
     try:
         while True:
             if backend_proc.poll() is not None:
                 print(f"❌ Backend 异常退出 (Exit Code: {backend_proc.returncode})")
+                break
+            if frontend_proc.poll() is not None:
+                print(f"❌ Frontend 异常退出 (Exit Code: {frontend_proc.returncode})")
                 break
             time.sleep(1)
     except KeyboardInterrupt:
         pass
     finally:
         if backend_proc.poll() is None: backend_proc.terminate()
+        if frontend_proc.poll() is None: frontend_proc.terminate()
 
 if __name__ == "__main__":
     main()
