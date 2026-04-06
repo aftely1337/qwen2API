@@ -197,13 +197,15 @@ async def register_qwen_account() -> Optional[Account]:
         username = _gen_username()
         log.info(f"[Register] [1/7] 邮箱: {email}  用户名: {username}")
 
-        async with _new_browser() as browser:
-            page = await browser.new_page()
-            log.info(f"[Register] [2/7] 打开注册页面: {BASE_URL}/auth?action=signup")
-            try:
-                await page.goto(f"{BASE_URL}/auth?action=signup", wait_until="domcontentloaded", timeout=60000)
-            except Exception:
-                pass
+        try:
+            async with _new_browser() as browser:
+                page = await browser.new_page()
+                log.info(f"[Register] [2/7] 打开注册页面: {BASE_URL}/auth?action=signup")
+                try:
+                    await page.goto(f"{BASE_URL}/auth?action=signup", wait_until="domcontentloaded", timeout=60000)
+                except Exception as e:
+                    log.warning(f"[Register] [2/7] 页面加载异常: {e}")
+                    pass
 
             log.info("[Register] [3/7] 填写注册表单...")
             name_input = None
