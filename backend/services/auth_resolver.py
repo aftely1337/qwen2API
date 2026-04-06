@@ -320,12 +320,13 @@ async def register_qwen_account() -> Optional[Account]:
                     return None
 
                 log.info("[Register] [7/7] 提取 cookies...")
-            all_cookies = await page.context.cookies()
-            cookie_str = "; ".join(f"{c.get('name','')}={c.get('value','')}" for c in all_cookies if "qwen" in c.get("domain", ""))
-            log.info(f"[Register] ✓ 注册完成: {email}")
-            return Account(email=email, password=password, token=token, cookies=cookie_str, username=username, activation_pending=False)
+                all_cookies = await page.context.cookies()
+                cookie_str = "; ".join(f"{c.get('name','')}={c.get('value','')}" for c in all_cookies if "qwen" in c.get("domain", ""))
+                log.info(f"[Register] ✓ 注册完成: {email}")
+                return Account(email=email, password=password, token=token, cookies=cookie_str, username=username, activation_pending=False)
         except Exception as e:
-            log.error(f"[Refresh] {acc.email} 刷新异常: {e}")
+            import traceback
+            log.error(f"[Register] 注册异常: {e}\n{traceback.format_exc()}")
             return None
 
 async def activate_account(acc: Account) -> bool:
