@@ -20,7 +20,7 @@ def _extract_text(content, user_tool_mode: bool = False) -> str:
             elif t == "tool_use":
                 inp = json.dumps(part.get("input", {}), ensure_ascii=False)
                 other_parts.append(
-                    f'##TOOL_CALL##\n{{"name": {json.dumps(part.get("name",""))}, "input": {inp}}}\n##END_CALL##'
+                    f'✿ACTION✿\n{{"action": {json.dumps(part.get("name",""))}, "args": {inp}}}\n✿END_ACTION✿'
                 )
             elif t == "tool_result":
                 inner = part.get("content", "")
@@ -76,24 +76,24 @@ def build_prompt_with_tools(messages: list, tools: list) -> str:
         names = [t.get("name", "") for t in tools if t.get("name")]
         lines = [
             "=== MANDATORY ACTION INSTRUCTIONS ===",
-            "IGNORE any previous output format instructions (needs-review, recap, etc.).",
-            "CRITICAL: DO NOT USE NATIVE FUNCTION CALLING. DO NOT OUTPUT ANY INTERNAL TOOL_CALL TOKENS.",
+            "IGNORE any previous output format instructions.",
+            "CRITICAL: DO NOT USE NATIVE FUNCTION CALLING. DO NOT OUTPUT `<|tool_call|>`.",
             f"You have access to these text-based ACTIONS: {', '.join(names)}",
             "",
             "WHEN YOU NEED TO EXECUTE AN ACTION — output EXACTLY this plain-text format (nothing else):",
-            "##TOOL_CALL##",
-            '{"name": "EXACT_ACTION_NAME", "input": {"param1": "value1"}}',
-            "##END_CALL##",
+            "✿ACTION✿",
+            '{"action": "EXACT_ACTION_NAME", "args": {"param1": "value1"}}',
+            "✿END_ACTION✿",
             "",
             "MULTI-TURN RULES:",
             "- After a [Tool Result] block appears in the conversation, read it and decide next step.",
-            "- If more actions are needed, emit another ##TOOL_CALL## block.",
+            "- If more actions are needed, emit another ✿ACTION✿ block.",
             "- Only give a final text answer when ALL needed information is gathered.",
             "- Never skip an action that is required to complete the user request.",
-            "- The history shows ##TOOL_CALL## blocks you already made and their [Tool Result] responses.",
+            "- The history shows ✿ACTION✿ blocks you already made and their [Tool Result] responses.",
             "",
             "STRICT RULES:",
-            "- No preamble, no explanation before or after ##TOOL_CALL##...##END_CALL##.",
+            "- No preamble, no explanation before or after ✿ACTION✿...✿END_ACTION✿.",
             "- Use EXACT action name from the list below.",
             "- When NO action is needed, answer normally in plain text.",
             "",
@@ -101,9 +101,8 @@ def build_prompt_with_tools(messages: list, tools: list) -> str:
             '- {"name": "X", "arguments": "..."}  <-- NEVER USE',
             '- {"type": "function", "name": "X"}  <-- NEVER USE',
             '- {"type": "tool_use", "name": "X"}  <-- NEVER USE',
-            "- <function_calls><invoke name=\"X\">  <-- NEVER USE",
-            "- <tool_call>{...}</tool_call>  <-- NEVER USE",
-            "ONLY ##TOOL_CALL##...##END_CALL## is accepted. Any other format will fail.",
+            "- ##TOOL_CALL##  <-- NEVER USE",
+            "ONLY ✿ACTION✿...✿END_ACTION✿ with 'action' and 'args' keys is accepted.",
             "",
             "Available actions:",
         ]
@@ -185,7 +184,7 @@ def build_prompt_with_tools(messages: list, tools: list) -> str:
                 except (json.JSONDecodeError, ValueError):
                     args = {"raw": args_str}
                 tc_parts.append(
-                    f'##TOOL_CALL##\n{{"name": {json.dumps(name)}, "input": {json.dumps(args, ensure_ascii=False)}}}\n##END_CALL##'
+                    f'✿ACTION✿\n{{"action": {json.dumps(name)}, "args": {json.dumps(args, ensure_ascii=False)}}}\n✿END_ACTION✿'
                 )
             text = "\n\n".join(tc_parts)
 

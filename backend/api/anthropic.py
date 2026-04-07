@@ -118,8 +118,8 @@ async def anthropic_messages(request: Request):
                             inp = json.loads(tc["args"]) if tc["args"] else {}
                         except (json.JSONDecodeError, ValueError):
                             inp = {"raw": tc["args"]}
-                        # 将原生调用转化为自定义的 ##TOOL_CALL## 语法交由统一解析器处理
-                        tc_parts.append(f'##TOOL_CALL##\n{{"name": {json.dumps(name)}, "input": {json.dumps(inp, ensure_ascii=False)}}}\n##END_CALL##')
+                        # 将原生调用转化为自定义的 ✿ACTION✿ 语法交由统一解析器处理
+                        tc_parts.append(f'✿ACTION✿\n{{"action": {json.dumps(name)}, "args": {json.dumps(inp, ensure_ascii=False)}}}\n✿END_ACTION✿')
                     answer_text = "\n\n".join(tc_parts)
 
                 reasoning_text = "".join(thinking_chunks)

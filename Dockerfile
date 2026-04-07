@@ -43,5 +43,6 @@ ENV FRONTEND_DIST_DIR=/workspace/frontend/dist
 ENV ACCOUNTS_FILE=/workspace/data/accounts.json
 ENV USERS_FILE=/workspace/data/users.json
 ENV CAPTURES_FILE=/workspace/data/captures.json
+ENV PYTHONPATH=/workspace
 
 CMD ["python", "backend/main.py"]
