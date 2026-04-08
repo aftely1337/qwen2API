@@ -45,4 +45,4 @@ ENV USERS_FILE=/workspace/data/users.json
 ENV CAPTURES_FILE=/workspace/data/captures.json
 ENV PYTHONPATH=/workspace
 
-CMD ["python", "backend/main.py"]
+CMD ["python", "-m", "backend.main"]

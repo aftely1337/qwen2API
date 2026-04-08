@@ -124,15 +124,15 @@ class QwenClient:
         except Exception:
             return []
 
-    def _build_payload(self, chat_id: str, model: str, content: str, has_custom_tools: bool = True) -> dict:
+    def _build_payload(self, chat_id: str, model: str, content: str, has_custom_tools: bool = False) -> dict:
         ts = int(time.time())
         feature_config = {
             "thinking_enabled": True, "output_schema": "phase", "research_mode": "normal",
             "auto_thinking": True, "thinking_mode": "Auto", "thinking_format": "summary",
-            "auto_search": False,
-            "code_interpreter": False,
-            "function_calling": has_custom_tools,
-            "plugins_enabled": False,
+            "auto_search": not has_custom_tools,
+            "code_interpreter": not has_custom_tools,
+            "function_calling": not has_custom_tools,  # disable Qwen native tool calls
+            "plugins_enabled": not has_custom_tools,
         }
         return {
             "stream": True, "version": "2.1", "incremental_output": True,
@@ -175,7 +175,7 @@ class QwenClient:
                 })
         return parsed
 
-    async def chat_stream_events_with_retry(self, model: str, content: str, has_custom_tools: bool = True):
+    async def chat_stream_events_with_retry(self, model: str, content: str, has_custom_tools: bool = False):
         """无感容灾重试逻辑：上游挂了自动换号"""
         exclude = set()
         for attempt in range(settings.MAX_RETRIES):
@@ -190,6 +190,7 @@ class QwenClient:
                 # First yield the chat_id and account to the consumer
                 yield {"type": "meta", "chat_id": chat_id, "acc": acc}
 
+                buffer = ""
                 async for chunk_result in self.engine.fetch_chat(acc.token, chat_id, payload):
                     if chunk_result.get("status") == 429:
                         raise Exception("Engine Queue Full")
@@ -197,9 +198,19 @@ class QwenClient:
                         raise Exception(f"HTTP {chunk_result['status']}: {chunk_result.get('body', '')[:100]}")
                     
                     if "chunk" in chunk_result:
-                        events = self.parse_sse_chunk(chunk_result["chunk"])
-                        for evt in events:
-                            yield {"type": "event", "event": evt}
+                        buffer += chunk_result["chunk"]
+                        while "\n\n" in buffer:
+                            msg, buffer = buffer.split("\n\n", 1)
+                            events = self.parse_sse_chunk(msg)
+                            for evt in events:
+                                yield {"type": "event", "event": evt}
+                    elif "body" in chunk_result and chunk_result["body"] and chunk_result["body"] != "streamed":
+                        buffer += chunk_result["body"]
+                
+                if buffer:
+                    events = self.parse_sse_chunk(buffer)
+                    for evt in events:
+                        yield {"type": "event", "event": evt}
                 return
                 
             except Exception as e:

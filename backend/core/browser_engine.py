@@ -24,7 +24,7 @@ async (args) => {
 JS_STREAM_FULL = """
 async (args) => {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 150000);  // 150s timeout
+    const timer = setTimeout(() => controller.abort(), 1800000);  // 1800s timeout
     try {
         const res = await fetch(args.url, {
             method: 'POST',
@@ -42,16 +42,14 @@ async (args) => {
         }
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
+        let body = '';
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            const chunk = decoder.decode(value, { stream: true });
-            if (window.send_chunk) {
-                await window.send_chunk(args.chat_id, chunk);
-            }
+            body += decoder.decode(value, { stream: true });
         }
         clearTimeout(timer);
-        return { status: res.status, body: "streamed" };
+        return { status: res.status, body: body };
     } catch(e) {
         clearTimeout(timer);
         return { status: 0, body: 'JS error: ' + e.message };
@@ -216,41 +214,24 @@ class BrowserEngine:
             yield {"status": 429, "body": "Too Many Requests (Queue full)"}
             return
 
-        queue = asyncio.Queue()
-        self.stream_queues[chat_id] = queue
-
         needs_refresh = False
         url = f'/api/v2/chat/completions?chat_id={chat_id}'
-
-        async def _run_eval():
-            try:
-                res = await asyncio.wait_for(
-                    page.evaluate(JS_STREAM_FULL, {"url": url, "token": token, "payload": payload, "chat_id": chat_id}),
-                    timeout=180,
-                )
-                queue.put_nowait({"type": "end", "result": res})
-            except asyncio.TimeoutError:
-                queue.put_nowait({"type": "end", "result": {"status": 0, "body": "Timeout"}})
-            except Exception as e:
-                queue.put_nowait({"type": "end", "result": {"status": 0, "body": str(e)}})
-
-        task = asyncio.create_task(_run_eval())
-
         try:
-            while True:
-                item = await queue.get()
-                if isinstance(item, str):
-                    yield {"status": 200, "chunk": item}
-                elif isinstance(item, dict) and item.get("type") == "end":
-                    res = item["result"]
-                    if res.get("status") != 200 and res.get("status") != "streamed":
-                        log.warning(f"[Browser] JS Error/Non-200: {res.get('body','')[:100]}")
-                        needs_refresh = True
-                        yield res
-                    break
+            res = await asyncio.wait_for(
+                page.evaluate(JS_STREAM_FULL, {"url": url, "token": token, "payload": payload}),
+                timeout=1800,
+            )
+            if res.get("status") != 200:
+                log.warning(f"[Browser] JS Error/Non-200: {res.get('body','')[:100]}")
+                needs_refresh = True
+            yield res
+        except asyncio.TimeoutError:
+            needs_refresh = True
+            yield {"status": 0, "body": "Timeout"}
+        except Exception as e:
+            needs_refresh = True
+            yield {"status": 0, "body": str(e)}
         finally:
-            if chat_id in self.stream_queues:
-                del self.stream_queues[chat_id]
             if needs_refresh:
                 asyncio.create_task(self._refresh_page_and_return(page))
             else:

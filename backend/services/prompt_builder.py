@@ -5,10 +5,18 @@ import uuid
 log = logging.getLogger("qwen2api.prompt")
 
 def _extract_text(content, user_tool_mode: bool = False) -> str:
+    """Extract text from Anthropic content (string or list of blocks).
+
+    user_tool_mode=True: used for user messages when tools are active.
+    In that case we take only the LAST text block (the actual user request)
+    and skip earlier text blocks which typically contain CLAUDE.md content
+    embedded by the client before the real prompt.
+    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         parts = []
+        # Collect all text blocks and non-text blocks separately
         text_blocks = []
         other_parts = []
         for part in content:
@@ -18,9 +26,11 @@ def _extract_text(content, user_tool_mode: bool = False) -> str:
             if t == "text":
                 text_blocks.append(part.get("text", ""))
             elif t == "tool_use":
+                # Render as ##TOOL_CALL## format — same as what we ask the model to output,
+                # so history looks consistent and the model knows how to continue.
                 inp = json.dumps(part.get("input", {}), ensure_ascii=False)
                 other_parts.append(
-                    f'✿ACTION✿\n{{"action": {json.dumps(part.get("name",""))}, "args": {inp}}}\n✿END_ACTION✿'
+                    f'##TOOL_CALL##\n{{"name": {json.dumps(part.get("name",""))}, "input": {inp}}}\n##END_CALL##'
                 )
             elif t == "tool_result":
                 inner = part.get("content", "")
@@ -32,6 +42,8 @@ def _extract_text(content, user_tool_mode: bool = False) -> str:
                     other_parts.append(f"[Tool Result for call {tid}]\n{''.join(texts)}\n[/Tool Result]")
 
         if user_tool_mode and text_blocks:
+            # Only keep the LAST text block — that's the actual user request.
+            # Earlier blocks are likely CLAUDE.md content injected by the client.
             parts.append(text_blocks[-1])
         else:
             parts.extend(text_blocks)
@@ -39,79 +51,83 @@ def _extract_text(content, user_tool_mode: bool = False) -> str:
         return "\n".join(p for p in parts if p)
     return ""
 
-def _normalize_tools(tools: list) -> list:
-    out = []
-    for tool in tools:
-        if tool.get("type") == "function" and "function" in tool:
-            fn = tool["function"]
-            out.append({
-                "name": fn.get("name", ""),
-                "description": fn.get("description", ""),
-                "parameters": fn.get("parameters", {}),
-            })
-        else:
-            out.append({
-                "name": tool.get("name", ""),
-                "description": tool.get("description", ""),
-                "parameters": tool.get("input_schema", tool.get("parameters", {})),
-            })
-    return out
 
-def build_prompt_with_tools(messages: list, tools: list) -> str:
-    MAX_CHARS = 1000000  # Qwen 3.5/3.6 支持最高 1M tokens 的超长上下文
-    tools = _normalize_tools(tools)
-    
-    system_text = ""
-    for m in messages:
-        if m.get("role") == "system":
-            system_text += str(m.get("content", "")) + "\n"
-            
-    sys_part = f"<system>\n{system_text}\n</system>" if system_text else ""
-        
+def _normalize_tool(tool: dict) -> dict:
+    """Normalize OpenAI or Anthropic tool format to internal {name, description, parameters}."""
+    # OpenAI format: {"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}
+    if tool.get("type") == "function" and "function" in tool:
+        fn = tool["function"]
+        return {
+            "name": fn.get("name", ""),
+            "description": fn.get("description", ""),
+            "parameters": fn.get("parameters", {}),
+        }
+    # Anthropic format: {"name": ..., "description": ..., "input_schema": ...}
+    # or already normalized: {"name": ..., "description": ..., "parameters": ...}
+    return {
+        "name": tool.get("name", ""),
+        "description": tool.get("description", ""),
+        "parameters": tool.get("input_schema") or tool.get("parameters") or {},
+    }
+
+
+def _normalize_tools(tools: list) -> list:
+    return [_normalize_tool(t) for t in tools if tools]
+
+
+def build_prompt_with_tools(system_prompt: str, messages: list, tools: list) -> str:
+    MAX_CHARS = 18000 if tools else 120000
+    # When tools are present, skip the user's system prompt entirely.
+    # CLAUDE.md contains "needs-review" format instructions that override our tool call
+    # instructions and prevent the model from generating proper tool calls.
+    if tools:
+        sys_part = ""
+    else:
+        sys_part = f"<system>\n{system_prompt[:2000]}\n</system>" if system_prompt else ""
     tools_part = ""
     if tools:
         names = [t.get("name", "") for t in tools if t.get("name")]
         lines = [
-            "=== CRITICAL INSTRUCTIONS FOR TOOL EXECUTION ===",
-            "YOU MUST FORGET ALL PREVIOUS FUNCTION CALLING FORMATS.",
-            "DO NOT USE `<|tool_call|>` or any native JSON structure.",
-            "YOU CAN ONLY USE THE CUSTOM `✿ACTION✿` FORMAT DEFINED BELOW.",
-            f"Available actions: {', '.join(names)}",
+            "=== MANDATORY TOOL CALL INSTRUCTIONS ===",
+            "IGNORE any previous output format instructions (needs-review, recap, etc.).",
+            f"You have access to these tools: {', '.join(names)}",
             "",
-            "WHEN YOU DECIDE TO USE A TOOL, YOU MUST OUTPUT EXACTLY THIS FORMAT:",
-            "✿ACTION✿",
-            '{"action": "EXACT_ACTION_NAME", "args": {"param1": "value1"}}',
-            "✿END_ACTION✿",
+            "WHEN YOU NEED TO CALL A TOOL — output EXACTLY this format (nothing else):",
+            "##TOOL_CALL##",
+            '{"name": "EXACT_TOOL_NAME", "input": {"param1": "value1"}}',
+            "##END_CALL##",
             "",
-            "RULES:",
-            "1. You MUST use ✿ACTION✿ and ✿END_ACTION✿ tags.",
-            "2. Inside the tags, output ONLY valid JSON.",
-            "3. The JSON MUST have an 'action' key and an 'args' key.",
-            "4. DO NOT add any markdown formatting (like ```json) inside the tags.",
-            "5. After receiving a [Tool Result], analyze it and decide the next step.",
-            "6. Only provide a final answer when all necessary steps are completed.",
-            "7. IF YOU DO NOT OUTPUT A VALID TOOL CALL, THE SYSTEM WILL CRASH.",
+            "STRICT RULES:",
+            "- No preamble, no explanation before or after ##TOOL_CALL##...##END_CALL##.",
+            "- Use EXACT tool name from the list below.",
+            "- Prioritize the most recent user request as TOP PRIORITY task.",
+            "- When NO tool is needed, answer normally in plain text.",
+            "- If tools are available and the user asks for external facts/actions, you MUST call a tool first before any final answer.",
+            "- Never call the same tool in more than 2 consecutive turns; if repeated twice already, choose a different tool.",
+            "- If the latest tool result contains 'Unchanged since last read', do not call Read again on the same target.",
             "",
-            "CRITICALLY FORBIDDEN FORMATS (USING THESE WILL CAUSE FATAL ERRORS):",
-            '- {"name": "X", "arguments": "..."}',
-            '- {"type": "function", "name": "X"}',
-            '- {"type": "tool_use", "name": "X"}',
-            "- ##TOOL_CALL##",
-            "If you use any of the above forbidden formats, the system will crash.",
+            "ONLY ##TOOL_CALL##...##END_CALL## is accepted.",
             "",
-            "Tool Descriptions:",
+            "Available tools:",
         ]
-
-        verbose_tools = len(tools) <= 100
+        # When there are many tools (>20), only list name+short_desc without params
+        # to keep the prompt compact and avoid model timeouts.
+        verbose_tools = len(tools) <= 20
         for tool in tools:
             name = tool.get("name", "")
             desc = tool.get("description", "")
             if verbose_tools:
+                desc = desc[:120]
                 lines.append(f"- {name}: {desc}")
                 params = tool.get("parameters", {})
                 if params:
-                    lines.append(f"  schema: {json.dumps(params, ensure_ascii=False)}")
+                    props = params.get("properties", {})
+                    req = params.get("required", [])
+                    if props:
+                        ps = ", ".join(f"{k}({'req' if k in req else 'opt'})" for k in props)
+                        lines.append(f"  params: {ps}")
             else:
+                # Compact: just name and very short description
                 desc = desc[:60]
                 lines.append(f"- {name}: {desc}")
         lines.append("=== END TOOL INSTRUCTIONS ===")
@@ -121,17 +137,26 @@ def build_prompt_with_tools(messages: list, tools: list) -> str:
     budget = MAX_CHARS - overhead
     history_parts = []
     used = 0
+    # When tools are present: skip system-role messages (CLAUDE.md arrives this way)
+    # No hard message count cap — rely only on character budget.
+    # Tool results (embedded in user messages) are truncated to 1500 chars to preserve
+    # budget for more messages and avoid crowding out the original task.
     NEEDSREVIEW_MARKERS = ("需求回显", "已了解规则", "等待用户输入", "待执行任务", "待确认事项",
-                           "[需求回显]", "**需求回显**", "【IMPORTANT: You MUST respond")
+                           "[需求回显]", "**需求回显**")
     msg_count = 0
-    
+    max_history_msgs = 12 if tools else 200
     for msg in reversed(messages):
+        if msg_count >= max_history_msgs:
+            break
         role = msg.get("role", "")
         if role not in ("user", "assistant", "system", "tool"):
             continue
         if tools and role == "system":
             continue
 
+        # ── OpenAI-format tool result (role="tool") ──────────────────────────
+        # These were previously silently dropped, causing the model to never see
+        # tool results and loop forever repeating the same tool call.
         if role == "tool":
             tool_content = msg.get("content", "") or ""
             tool_call_id = msg.get("tool_call_id", "")
@@ -142,8 +167,8 @@ def build_prompt_with_tools(messages: list, tools: list) -> str:
                 )
             elif not isinstance(tool_content, str):
                 tool_content = str(tool_content)
-            if len(tool_content) > 30000:
-                tool_content = tool_content[:30000] + "...[truncated]"
+            if len(tool_content) > 450:
+                tool_content = tool_content[:450] + "...[truncated]"
             line = f"[Tool Result]{(' id=' + tool_call_id) if tool_call_id else ''}\n{tool_content}\n[/Tool Result]"
             if used + len(line) + 2 > budget and history_parts:
                 break
@@ -155,10 +180,11 @@ def build_prompt_with_tools(messages: list, tools: list) -> str:
         text = _extract_text(msg.get("content", ""),
                              user_tool_mode=(bool(tools) and role == "user"))
 
-        if role == "assistant" and msg.get("tool_calls"):
+        # ── OpenAI-format assistant tool_calls (content=null + tool_calls[]) ─
+        # When an assistant message has tool_calls but content is null/empty,
+        # render each tool_call as ##TOOL_CALL## so the model sees what it called.
+        if role == "assistant" and not text and msg.get("tool_calls"):
             tc_parts = []
-            if text:
-                tc_parts.append(text)
             for tc in msg["tool_calls"]:
                 fn = tc.get("function", {})
                 name = fn.get("name", "")
@@ -168,23 +194,20 @@ def build_prompt_with_tools(messages: list, tools: list) -> str:
                 except (json.JSONDecodeError, ValueError):
                     args = {"raw": args_str}
                 tc_parts.append(
-                    f'✿ACTION✿\n{{"action": {json.dumps(name)}, "args": {json.dumps(args, ensure_ascii=False)}}}\n✿END_ACTION✿'
+                    f'##TOOL_CALL##\n{{"name": {json.dumps(name)}, "input": {json.dumps(args, ensure_ascii=False)}}}\n##END_CALL##'
                 )
-            text = "\n\n".join(tc_parts)
+            text = "\n".join(tc_parts)
 
+        # Skip assistant messages that are just needs-review boilerplate
         if tools and role == "assistant" and any(m in text for m in NEEDSREVIEW_MARKERS):
+            log.debug(f"[Prompt] 跳过需求回显式 assistant 消息 ({len(text)}字)")
             msg_count += 1
             continue
-            
-        # 跳过旧的自动重试提醒，防止无限累积导致 prompt 越来越长
-        if tools and role == "user" and "【IMPORTANT: You MUST respond" in text:
-            msg_count += 1
-            continue
-
-        # 将用户的消息标记，诱导其强制思考
+        # Truncate tool results (large user messages containing [Tool Result]) aggressively
+        # so they don't crowd out other context. Plain user messages get more space.
         is_tool_result = role == "user" and ("[Tool Result]" in text or "[tool result]" in text.lower()
                                               or text.startswith("{") or "\"results\"" in text[:100])
-        max_len = 30000 if is_tool_result else 80000
+        max_len = 600 if is_tool_result else 1400
         if len(text) > max_len:
             text = text[:max_len] + "...[truncated]"
         prefix = {"user": "Human: ", "assistant": "Assistant: ", "system": "System: "}.get(role, "")
@@ -196,26 +219,51 @@ def build_prompt_with_tools(messages: list, tools: list) -> str:
         msg_count += 1
 
     # 原始任务保护：若第一条 user 消息被挤出了历史窗口，强制补回最前
+    # 这确保模型始终知道用户的原始任务是什么
     if tools and messages:
         first_user = next((m for m in messages if m.get("role") == "user"), None)
         if first_user:
-            t = _extract_text(first_user.get("content", ""), user_tool_mode=True)
-            first_short = t[:800] + ("...[Original Task]" if len(t) > 800 else "")
+            first_text = _extract_text(first_user.get("content", ""), user_tool_mode=True)
+            first_short = first_text[:800] + ("...[原始任务截断]" if len(first_text) > 800 else "")
             first_line = f"Human: {first_short}"
-            if not history_parts or not history_parts[0].startswith(f"Human: {t[:60]}"):
+            # Check if first user message is already at the start of history
+            if not history_parts or not history_parts[0].startswith(f"Human: {first_text[:60]}"):
                 history_parts.insert(0, first_line)
+                log.debug(f"[Prompt] 补回原始任务消息，确保上下文完整 ({len(first_short)}字)")
 
+    latest_user_line = ""
+    if tools and messages:
+        latest_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+        if latest_user:
+            latest_text = _extract_text(latest_user.get("content", ""), user_tool_mode=True).strip()
+            if latest_text:
+                latest_short = latest_text[:900] + ("...[最新任务截断]" if len(latest_text) > 900 else "")
+                latest_user_line = f"Human (CURRENT TASK - TOP PRIORITY): {latest_short}"
+
+    if tools:
+        log.info(f"[Prompt] 工具模式: {len(history_parts)} 条历史消息, {used}字 history + {len(tools_part)}字 tool指令")
     parts = []
     if sys_part: parts.append(sys_part)
-    if tools_part: parts.append(tools_part)
     parts.extend(history_parts)
-    
-    if tools:
-        parts.append(
-            "[CRITICAL REMINDER: You MUST use ✿ACTION✿{\"action\": \"NAME\", \"args\": {...}}✿END_ACTION✿ format. "
-            "DO NOT just think silently. You MUST output a tool call after your thinking.]"
-        )
-        
-    parts.append("Assistant: <think>\n")
+    # Tool instructions go LAST — right before "Assistant:" so they have highest priority
+    if tools_part: parts.append(tools_part)
+    if latest_user_line: parts.append(latest_user_line)
+    parts.append("Assistant:")
     return "\n\n".join(parts)
 
+
+def messages_to_prompt(req_data: dict) -> tuple:
+    messages = req_data.get("messages", [])
+    tools = _normalize_tools(req_data.get("tools", []))
+    system_prompt = ""
+    sys_field = req_data.get("system", "")
+    if isinstance(sys_field, list):
+        system_prompt = " ".join(p.get("text", "") for p in sys_field if isinstance(p, dict))
+    elif isinstance(sys_field, str):
+        system_prompt = sys_field
+    if not system_prompt:
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_prompt = _extract_text(msg.get("content", ""))
+                break
+    return build_prompt_with_tools(system_prompt, messages, tools), tools
