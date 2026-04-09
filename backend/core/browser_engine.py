@@ -1,94 +1,38 @@
 import asyncio
-import base64
-import json
 import logging
 import os
 from contextlib import asynccontextmanager
 
 log = logging.getLogger("qwen2api.browser")
 
-def _b64(params: dict) -> str:
-    """把参数字典序列化为 Base64 字符串，安全传入 JavaScript。
-    ensure_ascii=True 确保所有 Unicode 转为 \\uXXXX，Base64 解码后可被 atob/JSON.parse 正确处理。"""
-    return base64.b64encode(
-        json.dumps(params, ensure_ascii=True, separators=(',', ':')).encode('ascii')
-    ).decode('ascii')
-
-JS_FETCH_TEMPLATE = """
-(async () => {
-    const params = JSON.parse(atob('{B64}'));
+JS_FETCH = """
+async (args) => {
     const opts = {
-        method: params.method,
+        method: args.method,
         headers: {
             'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + params.token
+            'Authorization': 'Bearer ' + args.token
         }
     };
-    if (params.body_json) opts.body = params.body_json;
-    const res = await fetch(params.url, opts);
+    if (args.body) opts.body = JSON.stringify(args.body);
+    const res = await fetch(args.url, opts);
     const text = await res.text();
     return { status: res.status, body: text };
-})()
+}
 """
 
-JS_STREAM_CHUNKED_TEMPLATE = """
-(async () => {
-    const params = JSON.parse(atob('{B64}'));
+JS_STREAM_FULL = """
+async (args) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 1800000);
     try {
-        const res = await fetch(params.url, {
+        const res = await fetch(args.url, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Authorization': 'Bearer ' + params.token
+                'Authorization': 'Bearer ' + args.token
             },
-            body: params.payload_json,
-            signal: controller.signal
-        });
-        if (!res.ok) {
-            const t = await res.text();
-            clearTimeout(timer);
-            return { status: res.status, body: t.substring(0, 2000) };
-        }
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buf = '';
-        const FLUSH_CHARS = 400;
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) {
-                if (buf) await send_chunk(params.chat_id, buf);
-                break;
-            }
-            buf += decoder.decode(value, { stream: true });
-            if (buf.includes('\n\n') && buf.length >= FLUSH_CHARS) {
-                await send_chunk(params.chat_id, buf);
-                buf = '';
-            }
-        }
-        clearTimeout(timer);
-        return { status: 200, body: '__DONE__' };
-    } catch(e) {
-        clearTimeout(timer);
-        return { status: 0, body: 'JS error: ' + e.message };
-    }
-})()
-"""
-
-JS_STREAM_FULL_TEMPLATE = """
-(async () => {
-    const params = JSON.parse(atob('{B64}'));
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 1800000);
-    try {
-        const res = await fetch(params.url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': 'Bearer ' + params.token
-            },
-            body: params.payload_json,
+            body: JSON.stringify(args.payload),
             signal: controller.signal
         });
         if (!res.ok) {
@@ -110,7 +54,7 @@ JS_STREAM_FULL_TEMPLATE = """
         clearTimeout(timer);
         return { status: 0, body: 'JS error: ' + e.message };
     }
-})()
+}
 """
 
 _CAMOUFOX_OPTS = {
@@ -165,26 +109,15 @@ class BrowserEngine:
 
     async def _init_pages(self):
         log.info(f"[Browser] 正在初始化 {self.pool_size} 个并发渲染引擎页面...")
-        self.stream_queues = {}  # chat_id -> asyncio.Queue()
-
-        async def handle_chunk(chat_id, chunk):
-            if chat_id in self.stream_queues:
-                self.stream_queues[chat_id].put_nowait(chunk)
-
         for i in range(self.pool_size):
             page = await self._browser.new_page()
-            try:
-                await page.expose_function("send_chunk", handle_chunk)
-            except Exception as e:
-                log.error(f"[Browser] expose_function failed: {e}")
-
             try:
                 await page.goto(self.base_url, wait_until="domcontentloaded", timeout=60000)
             except Exception:
                 pass
             await asyncio.sleep(0.5)
             self._pages.put_nowait(page)
-            log.info(f"  [Browser] Page {i+1}/{self.pool_size} ready (等待接入千问核心数据)")
+            log.info(f"  [Browser] Page {i+1}/{self.pool_size} ready")
 
     @staticmethod
     async def _ensure_browser_installed():
@@ -232,20 +165,17 @@ class BrowserEngine:
         await asyncio.wait_for(self._ready.wait(), timeout=300)
         if not self._started:
             return {"status": 0, "body": "Browser engine failed to start"}
-        # Wait queue: timeout protects the system from hanging
         try:
             page = await asyncio.wait_for(self._pages.get(), timeout=60)
         except asyncio.TimeoutError:
             log.warning("[Browser] Queue timeout (60s) — No available pages.")
             return {"status": 429, "body": "Too Many Requests (Queue full)"}
-            
+
         needs_refresh = False
         try:
-            code = JS_FETCH_TEMPLATE.replace("{B64}", _b64({
-                "method": method, "url": path, "token": token,
-                "body_json": json.dumps(body, ensure_ascii=False) if body else None,
-            }))
-            result = await page.evaluate(code)
+            result = await page.evaluate(JS_FETCH, {
+                "method": method, "url": path, "token": token, "body": body,
+            })
             if result.get("status") == 0 and result.get("body", "").startswith("JS error:"):
                 needs_refresh = True
             return result
@@ -260,6 +190,7 @@ class BrowserEngine:
                 self._pages.put_nowait(page)
 
     async def fetch_chat(self, token: str, chat_id: str, payload: dict, buffered: bool = False):
+        """Always uses buffered mode (full SSE body), matching original qwen2api.py behavior."""
         await asyncio.wait_for(self._ready.wait(), timeout=300)
         if not self._started:
             yield {"status": 0, "body": "Browser engine failed to start"}
@@ -274,76 +205,15 @@ class BrowserEngine:
 
         needs_refresh = False
         url = f'/api/v2/chat/completions?chat_id={chat_id}'
-
-        # ── 缓冲模式（工具调用）：一次 JS evaluate，一次 IPC，最快 ──────────
-        if buffered:
-            try:
-                code = JS_STREAM_FULL_TEMPLATE.replace("{B64}", _b64({
-                    "url": url, "token": token,
-                    "payload_json": json.dumps(payload, ensure_ascii=True),
-                }))
-                res = await asyncio.wait_for(
-                    page.evaluate(code),
-                    timeout=1800,
-                )
-                if res.get("status") != 200:
-                    log.warning(f"[Browser] buffered JS Error: {res.get('body','')[:100]}")
-                    needs_refresh = True
-                yield res
-            except asyncio.TimeoutError:
-                needs_refresh = True
-                yield {"status": 0, "body": "Timeout"}
-            except Exception as e:
-                needs_refresh = True
-                yield {"status": 0, "body": str(e)}
-            finally:
-                if needs_refresh:
-                    asyncio.create_task(self._refresh_page_and_return(page))
-                else:
-                    self._pages.put_nowait(page)
-            return
-
-        # ── 流式模式（普通对话）：send_chunk IPC 实时转发 ────────────────────
-        queue: asyncio.Queue = asyncio.Queue()
-        self.stream_queues[chat_id] = queue
         try:
-            # 启动 JS 流式读取（不 await），同时从队列实时 yield 每个 chunk
-            code = JS_STREAM_CHUNKED_TEMPLATE.replace("{B64}", _b64({
-                "url": url, "token": token,
-                "payload_json": json.dumps(payload, ensure_ascii=True),
-                "chat_id": chat_id,
-            }))
-            js_task = asyncio.create_task(
-                page.evaluate(code)
+            res = await asyncio.wait_for(
+                page.evaluate(JS_STREAM_FULL, {"url": url, "token": token, "payload": payload}),
+                timeout=1800,
             )
-            # 从队列实时转发 chunk，直到 JS 任务结束且队列清空
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(queue.get(), timeout=120)
-                    yield {"status": "streamed", "chunk": chunk}
-                except asyncio.TimeoutError:
-                    if js_task.done():
-                        break
-                    log.warning(f"[Browser] 流式读取超时等待 chunk (chat_id={chat_id})")
-                    needs_refresh = True
-                    break
-                if js_task.done() and queue.empty():
-                    break
-
-            # 获取 JS 任务最终返回值（状态码 + 错误信息）
-            if not js_task.done():
-                try:
-                    final = await asyncio.wait_for(js_task, timeout=10)
-                except Exception:
-                    final = {"status": 0, "body": "task cancelled"}
-            else:
-                final = js_task.result() if not js_task.exception() else {"status": 0, "body": str(js_task.exception())}
-
-            if isinstance(final, dict) and final.get("status") not in (200, "streamed"):
-                log.warning(f"[Browser] JS 返回非200: {final.get('body','')[:100]}")
-                if final.get("status") != 200 and final.get("body") != "__DONE__":
-                    needs_refresh = True
-                    yield final
+            if res.get("status") == 0:
+                log.warning(f"[Browser] JS Error: {res.get('body','')[:100]}")
+                needs_refresh = True
+            yield res
         except asyncio.TimeoutError:
             needs_refresh = True
             yield {"status": 0, "body": "Timeout"}
@@ -351,7 +221,6 @@ class BrowserEngine:
             needs_refresh = True
             yield {"status": 0, "body": str(e)}
         finally:
-            self.stream_queues.pop(chat_id, None)
             if needs_refresh:
                 asyncio.create_task(self._refresh_page_and_return(page))
             else:
