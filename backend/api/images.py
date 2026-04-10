@@ -1,8 +1,8 @@
 """
 图片生成接口 — 兼容 OpenAI /v1/images/generations 规范。
 
-底层通过千问 chat.qwen.ai 的 T2I 接口（chat_type="t2i"）生成图片，
-使用 Wan 系列模型（wanx2.1-t2i-plus / wanx2.1-t2i-turbo）。
+底层通过千问网页当前真实的“生成图像”模式触发，而不是写死 wanx 模型名。
+页面实测结果显示：UI 仍显示 `Qwen3.6-Plus`，并通过“生成图像”模式完成图片生成。
 """
 import re
 import time
@@ -15,19 +15,17 @@ from backend.services.qwen_client import QwenClient
 log = logging.getLogger("qwen2api.images")
 router = APIRouter()
 
-# 默认图片生成模型（Wan 2.1 高质量版）
-DEFAULT_IMAGE_MODEL = "wanx2.1-t2i-plus"
+# 默认图片生成模型：网页实测仍显示为 Qwen3.6-Plus
+DEFAULT_IMAGE_MODEL = "qwen3.6-plus"
 
-# 受支持的图片模型别名 -> 实际模型名
+# 受支持的图片模型别名 -> 网页真实可用的基础模型
 IMAGE_MODEL_MAP = {
-    "dall-e-3":              "wanx2.1-t2i-plus",
-    "dall-e-2":              "wanx2.1-t2i-turbo",
-    "wanx2.1-t2i-plus":     "wanx2.1-t2i-plus",
-    "wanx2.1-t2i-turbo":    "wanx2.1-t2i-turbo",
-    "wanx-v1":               "wanx-v1",
-    "qwen-image":            "wanx2.1-t2i-plus",
-    "qwen-image-plus":       "wanx2.1-t2i-plus",
-    "qwen-image-turbo":      "wanx2.1-t2i-turbo",
+    "dall-e-3": "qwen3.6-plus",
+    "dall-e-2": "qwen3.6-plus",
+    "qwen-image": "qwen3.6-plus",
+    "qwen-image-plus": "qwen3.6-plus",
+    "qwen-image-turbo": "qwen3.6-plus",
+    "qwen3.6-plus": "qwen3.6-plus",
 }
 
 
@@ -46,7 +44,7 @@ def _extract_image_urls(text: str) -> list[str]:
 
     # 3. 裸 URL（以常见图片扩展名结尾，或来自已知 CDN）
     if not urls:
-        cdn_pattern = r'https?://(?:wanx\.alicdn\.com|img\.alicdn\.com|[^\s"<>]+\.(?:jpg|jpeg|png|webp|gif))[^\s"<>]*'
+        cdn_pattern = r'https?://(?:cdn\.qwenlm\.ai|wanx\.alicdn\.com|img\.alicdn\.com|[^\s"<>]+\.(?:jpg|jpeg|png|webp|gif))[^\s"<>]*'
         for u in re.findall(cdn_pattern, text, re.IGNORECASE):
             urls.append(u.rstrip(".,;)\"'>"))
 

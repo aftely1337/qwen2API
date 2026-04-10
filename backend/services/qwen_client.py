@@ -206,20 +206,40 @@ class QwenClient:
     def _build_image_payload(self, chat_id: str, model: str, prompt: str) -> dict:
         ts = int(time.time())
         feature_config = {
-            "thinking_enabled": False, "output_schema": "phase",
-            "auto_thinking": False, "thinking_mode": "off",
-            "auto_search": False, "code_interpreter": False,
-            "function_calling": False, "plugins_enabled": True,
+            "thinking_enabled": False,
+            "output_schema": "phase",
+            "auto_thinking": False,
+            "thinking_mode": "off",
+            "auto_search": False,
+            "code_interpreter": False,
+            "function_calling": False,
+            "plugins_enabled": True,
+            "image_generation": True,
+            "default_aspect_ratio": "16:9",
         }
         return {
-            "stream": True, "version": "2.1", "incremental_output": True,
-            "chat_id": chat_id, "chat_mode": "normal", "model": model, "parent_id": None,
+            "stream": True,
+            "version": "2.1",
+            "incremental_output": True,
+            "chat_id": chat_id,
+            "chat_mode": "normal",
+            "model": model,
+            "parent_id": None,
             "messages": [{
-                "fid": str(uuid.uuid4()), "parentId": None, "childrenIds": [str(uuid.uuid4())],
-                "role": "user", "content": prompt, "user_action": "chat", "files": [],
-                "timestamp": ts, "models": [model], "chat_type": "t2i",
+                "fid": str(uuid.uuid4()),
+                "parentId": None,
+                "childrenIds": [str(uuid.uuid4())],
+                "role": "user",
+                "content": prompt,
+                "user_action": "chat",
+                "files": [],
+                "timestamp": ts,
+                "models": [model],
+                "chat_type": "t2t",
                 "feature_config": feature_config,
-                "extra": {"meta": {"subChatType": "t2i"}}, "sub_chat_type": "t2i", "parent_id": None,
+                "extra": {"meta": {"subChatType": "t2i", "mode": "image_generation", "aspectRatio": "16:9"}},
+                "sub_chat_type": "t2i",
+                "parent_id": None,
             }],
             "timestamp": ts,
         }
@@ -238,7 +258,7 @@ class QwenClient:
                 events.append(obj)
             except Exception:
                 continue
-        
+
         parsed = []
         for evt in events:
             if evt.get("choices"):
@@ -249,6 +269,14 @@ class QwenClient:
                     "content": delta.get("content", ""),
                     "status": delta.get("status", ""),
                     "extra": delta.get("extra", {})
+                })
+            elif evt.get("phase"):
+                parsed.append({
+                    "type": "delta",
+                    "phase": evt.get("phase", "answer"),
+                    "content": evt.get("content", "") or evt.get("text", "") or "",
+                    "status": evt.get("status", ""),
+                    "extra": evt.get("extra", {})
                 })
         return parsed
 
@@ -359,6 +387,50 @@ class QwenClient:
                 
         raise Exception(f"All {settings.MAX_RETRIES} attempts failed. Please check upstream accounts.")
 
+    def _extract_urls_from_extra(self, extra: dict) -> list[str]:
+        """从 SSE event 的 extra 字段提取图片 URL。
+
+        已知格式：
+        - extra.tool_result[0].image  (image_gen_tool finished 事件，最主要路径)
+        - extra.image_url / extra.wanx_image_url / extra.imageUrl
+        - extra.image_urls / extra.images / extra.imageUrls (列表)
+        """
+        urls = []
+        if not extra or not isinstance(extra, dict):
+            return urls
+
+        # ① image_gen_tool 完成事件：extra.tool_result[].image
+        tool_result = extra.get("tool_result")
+        if isinstance(tool_result, list):
+            for item in tool_result:
+                if isinstance(item, dict):
+                    for key in ("image", "url", "src", "imageUrl", "image_url"):
+                        val = item.get(key)
+                        if isinstance(val, str) and val.startswith("http"):
+                            urls.append(val)
+                elif isinstance(item, str) and item.startswith("http"):
+                    urls.append(item)
+
+        # ② 平铺字段
+        for key in ("image_url", "wanx_image_url", "imageUrl"):
+            val = extra.get(key)
+            if isinstance(val, str) and val.startswith("http"):
+                urls.append(val)
+
+        # ③ 列表字段
+        for key in ("image_urls", "images", "imageUrls"):
+            val = extra.get(key)
+            if isinstance(val, list):
+                for item in val:
+                    if isinstance(item, str) and item.startswith("http"):
+                        urls.append(item)
+                    elif isinstance(item, dict):
+                        for sub_key in ("url", "src", "image", "imageUrl"):
+                            sub_val = item.get(sub_key)
+                            if isinstance(sub_val, str) and sub_val.startswith("http"):
+                                urls.append(sub_val)
+        return urls
+
     async def image_generate_with_retry(self, model: str, prompt: str, exclude_accounts: Optional[set[str]] = None) -> tuple[str, "Account", str]:
         """调用千问 T2I 生成图片，返回 (原始响应文本, 使用的账号, chat_id)"""
         exclude = set(exclude_accounts or set())
@@ -377,35 +449,80 @@ class QwenClient:
                 self.active_chat_ids.add(chat_id)
                 payload = self._build_image_payload(chat_id, model, prompt)
 
-                buffer = ""
+                raw_body_parts: list[str] = []  # 保存原始 SSE body 用于 debug
                 answer_text = ""
+                extra_urls: list[str] = []
+                buffer = ""
+
                 async for chunk_result in self.engine.fetch_chat(acc.token, chat_id, payload):
                     if chunk_result.get("status") == 429:
                         raise Exception("Engine Queue Full")
                     if chunk_result.get("status") not in (200, "streamed"):
                         raise Exception(f"HTTP {chunk_result['status']}: {chunk_result.get('body', '')[:200]}")
-                    if "chunk" in chunk_result:
-                        buffer += chunk_result["chunk"]
-                        while "\n\n" in buffer:
-                            msg, buffer = buffer.split("\n\n", 1)
-                            for evt in self.parse_sse_chunk(msg):
-                                if evt.get("type") == "delta" and evt.get("phase") in ("answer", "t2i", "image"):
-                                    answer_text += evt.get("content", "")
-                                elif evt.get("type") == "delta":
-                                    # also capture any content that might contain image URLs
-                                    c = evt.get("content", "")
-                                    if "http" in c:
-                                        answer_text += c
 
-                if buffer:
-                    for evt in self.parse_sse_chunk(buffer):
-                        if evt.get("type") == "delta":
-                            c = evt.get("content", "")
-                            if evt.get("phase") in ("answer", "t2i", "image") or "http" in c:
-                                answer_text += c
+                    # 把原始文本拼进 buffer
+                    raw = ""
+                    if "chunk" in chunk_result:
+                        raw = chunk_result["chunk"]
+                    elif "body" in chunk_result:
+                        raw = chunk_result.get("body", "") or ""
+                    if not raw:
+                        continue
+
+                    raw_body_parts.append(raw)
+                    buffer += raw
+
+                # 处理整个 buffer（不论流式还是一次性返回）
+                raw_body = "".join(raw_body_parts)
+                log.info(f"[T2I] 原始 SSE body 前 1000 字符: {raw_body[:1000]!r}")
+
+                for line in raw_body.splitlines():
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if not data_str or data_str == "[DONE]":
+                        continue
+                    try:
+                        obj = json.loads(data_str)
+                    except Exception:
+                        continue
+
+                    # 打印每个 SSE 事件用于诊断
+                    log.info(f"[T2I-SSE] 事件: {json.dumps(obj, ensure_ascii=False)[:400]}")
+
+                    # 从 choices[0].delta 提取
+                    if obj.get("choices"):
+                        delta = obj["choices"][0].get("delta", {})
+                        content = delta.get("content", "")
+                        phase = delta.get("phase", "answer")
+                        extra = delta.get("extra", {})
+                        log.info(f"[T2I-SSE] phase={phase!r} content_len={len(content)} content_preview={content[:100]!r}")
+                        # 捕获所有文本内容
+                        answer_text += content
+                        # 捕获 extra 字段里的图片 URL
+                        extra_urls.extend(self._extract_urls_from_extra(extra))
+                    elif obj.get("phase"):
+                        # 直接顶层 phase 格式
+                        content = obj.get("content", "") or obj.get("text", "") or ""
+                        phase = obj.get("phase", "")
+                        extra = obj.get("extra", {})
+                        log.info(f"[T2I-SSE] 顶层 phase={phase!r} content_len={len(content)} content_preview={content[:100]!r}")
+                        answer_text += content
+                        extra_urls.extend(self._extract_urls_from_extra(extra))
+
+                # 如果 extra 里找到了图片 URL，把它们拼成 Markdown 图片格式追加进 answer_text
+                if extra_urls:
+                    log.info(f"[T2I] 从 extra 字段提取到 {len(extra_urls)} 个图片 URL: {extra_urls}")
+                    for url in extra_urls:
+                        answer_text += f"\n![image]({url})"
+
+                # 如果 answer_text 为空就用原始 body 作为保底
+                if not answer_text:
+                    answer_text = raw_body
 
                 self.active_chat_ids.discard(chat_id)
-                log.info(f"[T2I] 生成完成，响应长度={len(answer_text)}: {answer_text[:120]!r}")
+                log.info(f"[T2I] 生成完成，响应长度={len(answer_text)}: {answer_text[:200]!r}")
                 return answer_text, acc, chat_id
 
             except Exception as e:

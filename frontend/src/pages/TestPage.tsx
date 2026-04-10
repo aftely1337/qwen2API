@@ -5,6 +5,46 @@ import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
 import { toast } from "sonner"
 
+// 渲染消息内容：自动把 Markdown 图片和图片 URL 渲染成 <img>
+function MessageContent({ content }: { content: string }) {
+  type Seg = { start: number; end: number; url: string }
+  const segs: Seg[] = []
+  const fullRe = /!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s"<>]+\.(?:jpg|jpeg|png|webp|gif)[^\s"<>]*)/gi
+  let m: RegExpExecArray | null
+  while ((m = fullRe.exec(content)) !== null) {
+    segs.push({ start: m.index, end: m.index + m[0].length, url: (m[1] || m[2]) as string })
+  }
+
+  if (segs.length === 0) {
+    return <div className="whitespace-pre-wrap leading-relaxed">{content}</div>
+  }
+
+  const nodes: JSX.Element[] = []
+  let cursor = 0
+  segs.forEach((seg, i) => {
+    if (seg.start > cursor) {
+      nodes.push(<span key={"t" + i}>{content.slice(cursor, seg.start)}</span>)
+    }
+    nodes.push(
+      <div key={"i" + i} className="my-2">
+        <img
+          src={seg.url}
+          alt="generated"
+          className="max-w-full rounded-lg shadow-md border"
+          loading="lazy"
+          onError={e => { (e.currentTarget as HTMLImageElement).style.display = "none" }}
+        />
+        <div className="text-xs text-muted-foreground mt-1 break-all font-mono">{seg.url}</div>
+      </div>
+    )
+    cursor = seg.end
+  })
+  if (cursor < content.length) {
+    nodes.push(<span key="tail">{content.slice(cursor)}</span>)
+  }
+  return <div className="whitespace-pre-wrap leading-relaxed">{nodes}</div>
+}
+
 export default function TestPage() {
   const [messages, setMessages] = useState<{ role: string; content: string; error?: boolean }[]>([])
   const [input, setInput] = useState("")
@@ -26,7 +66,6 @@ export default function TestPage() {
 
     try {
       if (!stream) {
-        // ── 非流式 ──────────────────────────────────────────
         const res = await fetch(`${API_BASE}/v1/chat/completions`, {
           method: "POST",
           headers: { "Content-Type": "application/json", ...getAuthHeader() },
@@ -41,7 +80,6 @@ export default function TestPage() {
           setMessages(prev => [...prev, { role: "assistant", content: `❌ 未知响应: ${JSON.stringify(data)}`, error: true }])
         }
       } else {
-        // ── 流式 ──────────────────────────────────────────
         const res = await fetch(`${API_BASE}/v1/chat/completions`, {
           method: "POST",
           headers: { "Content-Type": "application/json", ...getAuthHeader() },
@@ -56,9 +94,7 @@ export default function TestPage() {
 
         if (!res.body) throw new Error("No response body")
 
-        // 先插一个带加载占位的 assistant 气泡
         setMessages(prev => [...prev, { role: "assistant", content: "" }])
-
         const reader = res.body.getReader()
         const decoder = new TextDecoder()
         let hasContent = false
@@ -68,18 +104,12 @@ export default function TestPage() {
           if (done) break
 
           const chunk = decoder.decode(value, { stream: true })
-          const lines = chunk.split("\n")
-
-          for (const rawLine of lines) {
+          for (const rawLine of chunk.split("\n")) {
             const line = rawLine.trim()
-            if (!line || line.startsWith(":")) continue  // 跳过注释和 keepalive
-            if (line === "data: [DONE]") continue
-
+            if (!line || line.startsWith(":") || line === "data: [DONE]") continue
             if (line.startsWith("data: ")) {
               try {
                 const data = JSON.parse(line.slice(6))
-
-                // 显式错误
                 if (data.error) {
                   setMessages(prev => {
                     const msgs = [...prev]
@@ -89,7 +119,6 @@ export default function TestPage() {
                   hasContent = true
                   break
                 }
-
                 const content: string = data.choices?.[0]?.delta?.content ?? ""
                 if (content) {
                   hasContent = true
@@ -100,14 +129,11 @@ export default function TestPage() {
                     return msgs
                   })
                 }
-              } catch (_) {
-                // 跳过无法解析的行
-              }
+              } catch (_) { /* skip */ }
             }
           }
         }
 
-        // 如果整个流结束都没有任何内容，显示友好错误
         if (!hasContent) {
           setMessages(prev => {
             const msgs = [...prev]
@@ -173,6 +199,8 @@ export default function TestPage() {
                   <span className="animate-pulse flex items-center gap-2 text-muted-foreground">
                     <Bot className="h-4 w-4" /> 思考中...
                   </span>
+                ) : msg.role === "assistant" && !msg.error ? (
+                  <MessageContent content={msg.content} />
                 ) : (
                   <div className="whitespace-pre-wrap leading-relaxed">{msg.content}</div>
                 )}

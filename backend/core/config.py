@@ -108,8 +108,8 @@ MODEL_MAP = {
     "deepseek-reasoner": "qwen3.6-plus",
 }
 
-# 图片模型不走 chat，不加入 MODEL_MAP
-IMAGE_MODEL_DEFAULT = "wanx2.1-t2i-plus"
+# 图片生成沿用网页当前真实可用的基础模型，不再写死 wanx 模型名
+IMAGE_MODEL_DEFAULT = "qwen3.6-plus"
 
 def resolve_model(name: str) -> str:
     return MODEL_MAP.get(name, name)
