@@ -375,23 +375,23 @@ async def collect_completion_run(
 
 
 def parse_tool_directive_once(request: StandardRequest, state: RuntimeAttemptState) -> RuntimeToolDirective:
+    if request.tools and state.answer_text:
+        tool_blocks, stop_reason = tool_parser.parse_tool_calls_silent(state.answer_text, request.tools)
+        return RuntimeToolDirective(tool_blocks=tool_blocks, stop_reason=stop_reason)
+
     if state.tool_calls:
         return RuntimeToolDirective(
             tool_blocks=[
                 {
                     "type": "tool_use",
                     "id": tool_call["id"],
-                    "name": tool_call["name"],
+                    "name": normalize_tool_name(tool_call["name"], request.tool_names),
                     "input": tool_call.get("input", {}),
                 }
                 for tool_call in state.tool_calls
             ],
             stop_reason="tool_use",
         )
-
-    if request.tools and state.answer_text:
-        tool_blocks, stop_reason = tool_parser.parse_tool_calls_silent(state.answer_text, request.tools)
-        return RuntimeToolDirective(tool_blocks=tool_blocks, stop_reason=stop_reason)
 
     return RuntimeToolDirective(tool_blocks=[{"type": "text", "text": state.answer_text}], stop_reason="end_turn")
 
@@ -489,9 +489,15 @@ def evaluate_retry_directive(
         return RuntimeRetryDirective(retry=False, next_prompt=current_prompt)
 
     if state.blocked_tool_names and request.tools:
-        if state.emitted_visible_output and not allow_after_visible_output:
-            return RuntimeRetryDirective(retry=False, next_prompt=current_prompt)
         blocked_name = normalize_tool_name_for_retry(state.blocked_tool_names[0], request.tool_names)
+        force_text = (
+            f"[MANDATORY NEXT STEP]: The server blocked tool '{blocked_name}' with 'Tool {blocked_name} does not exists.'. "
+            f"Retry immediately using ONLY this exact wrapper and no prose before or after it:\n"
+            f"<tool_call>{{\"name\": {json.dumps(blocked_name)}, \"input\": {{...your args here...}}}}</tool_call>"
+        )
+        if state.emitted_visible_output and not allow_after_visible_output:
+            next_prompt = inject_assistant_message(current_prompt, force_text)
+            return RuntimeRetryDirective(retry=True, next_prompt=next_prompt)
         return RuntimeRetryDirective(
             retry=True,
             next_prompt=tool_parser.inject_format_reminder(current_prompt, blocked_name),

@@ -245,11 +245,9 @@ def inject_format_reminder(prompt: str, tool_name: str) -> str:
     reminder = (
         f"[CORRECTION]: You called '{tool_name}' using the WRONG format — "
         f"the server BLOCKED it with 'Tool {tool_name} does not exists.'. "
-        f"You MUST use ##TOOL_CALL## format and NOTHING ELSE:\n"
-        f"##TOOL_CALL##\n"
-        f'{{\"name\": \"{tool_name}\", \"input\": {{...your args here...}}}}\n'
-        f"##END_CALL##\n"
-        f"DO NOT use JSON without delimiters. DO NOT use any XML tags. ONLY ##TOOL_CALL##.\n"
+        f"You MUST retry the SAME tool immediately using EXACTLY this XML wrapper and nothing else:\n"
+        f"<tool_call>{{\"name\": {json.dumps(tool_name)}, \"input\": {{...your args here...}}}}</tool_call>\n"
+        f"DO NOT use bare JSON. DO NOT use ##TOOL_CALL##. DO NOT write any prose before or after the wrapper.\n"
     )
     prompt = prompt.rstrip()
     if prompt.endswith("Assistant:"):

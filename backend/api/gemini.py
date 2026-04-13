@@ -132,7 +132,7 @@ async def gemini_stream_generate_content(model: str, request: Request):
         async def generate():
             queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-            async def on_delta(evt, text_chunk, _tool_calls):
+            async def on_delta(evt, text_chunk, _):
                 if text_chunk and evt.get("phase") == "answer":
                     await queue.put(stream_presenter.gemini_text_chunk(text_chunk))
 
