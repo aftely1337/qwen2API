@@ -58,6 +58,12 @@ def _extract_image_urls(text: str) -> list[str]:
     return result
 
 
+def _redact_url_query(url: str) -> str:
+    if "?" in url:
+        return url.split("?", 1)[0] + "?<redacted>"
+    return url
+
+
 def _resolve_image_model(requested: str | None) -> str:
     if not requested:
         return DEFAULT_IMAGE_MODEL
@@ -120,7 +126,7 @@ async def create_image(request: Request):
 
         # 提取图片 URL
         image_urls = _extract_image_urls(answer_text)
-        log.info(f"[T2I] 提取到 {len(image_urls)} 张图片 URL: {image_urls}")
+        log.info(f"[T2I] 提取到 {len(image_urls)} 张图片 URL: {[_redact_url_query(u) for u in image_urls]}")
 
         if not image_urls:
             log.warning(f"[T2I] 未能提取图片 URL，原始响应: {answer_text[:300]!r}")
@@ -182,21 +188,60 @@ async def edit_image(
         
         # TODO: 暂时忽略 mask 遮罩文件，千问可能不需要分离的遮罩，或者需要另外拼图。这里只上传主图。
         
-        # 3. 携带上传文件和刚才的账号，发起图生图生成，避免死锁
-        answer_text, used_acc, chat_id = await client.image_generate_with_retry(
-            model_resolved, 
-            prompt,
-            uploaded_files=[uploaded_file_info],
-            pre_acquired_acc=acc
-        )
+        answer_text = ""
+        used_acc = acc
+        chat_id = ""
+        try:
+            answer_text, used_acc, chat_id = await client.image_generate_with_retry(
+                model_resolved,
+                prompt,
+                uploaded_files=[uploaded_file_info],
+                pre_acquired_acc=acc
+            )
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "quota exceeded" in err_msg or "allocated quota exceeded" in err_msg or "token-limit" in err_msg:
+                desc_text, used_acc, desc_chat_id = await client.vision_chat_with_retry(
+                    model_resolved,
+                    "请描述这张图片的主要内容和构图细节（尽量客观、简洁）。",
+                    uploaded_files=[uploaded_file_info],
+                    pre_acquired_acc=acc
+                )
+                asyncio.create_task(client.delete_chat(used_acc.token, desc_chat_id))
+                combined_prompt = f"基于这张图片的描述：{desc_text}\n编辑要求：{prompt}"
+                answer_text, used_acc, chat_id = await client.image_generate_with_retry(
+                    model_resolved,
+                    combined_prompt,
+                    pre_acquired_acc=acc
+                )
+            else:
+                raise
 
-        # 后台清理会话
-        # 注意：此处不主动 release used_acc，因为在 finally 块中统一处理了 release(acc)
-        asyncio.create_task(client.delete_chat(used_acc.token, chat_id))
+        if chat_id:
+            asyncio.create_task(client.delete_chat(used_acc.token, chat_id))
 
-        # 提取图片 URL
+        if not answer_text:
+            raise HTTPException(status_code=500, detail="Empty upstream response")
+
+        lower_text = answer_text.lower()
+        if "allocated quota exceeded" in lower_text or "quota exceeded" in lower_text or "token-limit" in lower_text:
+            desc_text, used_acc, desc_chat_id = await client.vision_chat_with_retry(
+                model_resolved,
+                "请描述这张图片的主要内容和构图细节（尽量客观、简洁）。",
+                uploaded_files=[uploaded_file_info],
+                pre_acquired_acc=acc
+            )
+            asyncio.create_task(client.delete_chat(used_acc.token, desc_chat_id))
+            combined_prompt = f"基于这张图片的描述：{desc_text}\n编辑要求：{prompt}"
+            answer_text, used_acc, chat_id2 = await client.image_generate_with_retry(
+                model_resolved,
+                combined_prompt,
+                pre_acquired_acc=acc
+            )
+            asyncio.create_task(client.delete_chat(used_acc.token, chat_id2))
+
         image_urls = _extract_image_urls(answer_text)
-        log.info(f"[T2I-Edit] 提取到 {len(image_urls)} 张图片 URL: {image_urls}")
+        log.info(f"[T2I-Edit] 提取到 {len(image_urls)} 张图片 URL: {[_redact_url_query(u) for u in image_urls]}")
 
         if not image_urls:
             log.warning(f"[T2I-Edit] 未能提取图片 URL，原始响应: {answer_text[:300]!r}")
