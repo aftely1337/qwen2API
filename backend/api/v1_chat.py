@@ -10,19 +10,21 @@ from typing import Optional
 from backend.core.account_pool import Account
 from backend.services.qwen_client import QwenClient
 from backend.services.token_calc import calculate_usage
-from backend.services.prompt_builder import messages_to_prompt
+from backend.services.prompt_builder import messages_to_prompt, extract_image_urls_from_messages
 from backend.services.tool_parser import parse_tool_calls, inject_format_reminder, build_tool_blocks_from_native_chunks, should_block_tool_call
+import base64
+import httpx
 from backend.core.config import resolve_model, settings, IMAGE_MODEL_DEFAULT
 
 log = logging.getLogger("qwen2api.chat")
 router = APIRouter()
 
-async def _stream_items_with_keepalive(client, model: str, prompt: str, has_custom_tools: bool, exclude_accounts=None):
+async def _stream_items_with_keepalive(client, model: str, prompt: str, has_custom_tools: bool, exclude_accounts=None, uploaded_files: list = None):
     queue: aio.Queue = aio.Queue()
 
     async def _producer():
         try:
-            async for item in client.chat_stream_events_with_retry(model, prompt, has_custom_tools=has_custom_tools, exclude_accounts=exclude_accounts):
+            async for item in client.chat_stream_events_with_retry(model, prompt, has_custom_tools=has_custom_tools, exclude_accounts=exclude_accounts, uploaded_files=uploaded_files):
                 await queue.put(("item", item))
         except Exception as e:
             await queue.put(("error", e))
@@ -142,6 +144,31 @@ def _extract_image_urls(text: str) -> list[str]:
     return result
 
 
+async def process_image_urls(image_urls: list[str], client: QwenClient, token: str) -> list[dict]:
+    uploaded_files = []
+    for i, url in enumerate(image_urls):
+        try:
+            if url.startswith("data:image"):
+                # data:image/png;base64,iVBOR...
+                header, base64_str = url.split(",", 1)
+                content_type = header.split(";")[0].split(":")[1]
+                image_bytes = base64.b64decode(base64_str)
+            else:
+                # remote url
+                async with httpx.AsyncClient() as hc:
+                    resp = await hc.get(url, timeout=10)
+                    resp.raise_for_status()
+                    image_bytes = resp.content
+                    content_type = resp.headers.get("content-type", "image/jpeg")
+
+            ext = content_type.split("/")[-1] if "/" in content_type else "jpg"
+            filename = f"upload_{i}_{int(time.time())}.{ext}"
+            file_info = await client.upload_file(token, image_bytes, filename, content_type)
+            uploaded_files.append(file_info)
+        except Exception as e:
+            log.error(f"[process_image_urls] Failed to process image {url[:50]}: {e}")
+    return uploaded_files
+
 @router.post("/completions")
 @router.post("/chat/completions")
 @router.post("/v1/chat/completions")
@@ -194,6 +221,9 @@ async def chat_completions(request: Request):
         log.warning("[OAI] t2v intent detected but not yet validated; falling back to t2t")
         media_intent = "t2t"
 
+    image_urls_for_vision = extract_image_urls_from_messages(history_messages)
+    uploaded_files_for_vision = []
+    
     if media_intent == "t2i":
         image_prompt = _extract_last_user_text(history_messages)
         log.info(f"[OAI-T2I] Routing to image generation, model={IMAGE_MODEL_DEFAULT}, prompt={image_prompt[:80]!r}")
@@ -250,11 +280,23 @@ async def chat_completions(request: Request):
                 chat_id: Optional[str] = None
                 acc: Optional[Account] = None
 
+                # 上传图片以供多模态对话使用
+                nonlocal uploaded_files_for_vision
+                if image_urls_for_vision and not uploaded_files_for_vision:
+                    # 使用当前线程分配的可用账号上传图片
+                    upload_acc = await client.account_pool.acquire_wait(timeout=30)
+                    if not upload_acc:
+                        raise Exception("No account available for uploading images")
+                    try:
+                        uploaded_files_for_vision = await process_image_urls(image_urls_for_vision, client, upload_acc.token)
+                    finally:
+                        client.account_pool.release(upload_acc)
+
                 # ── 无工具：事件到来立即转发给客户端（真流式）──────────────
                 if not tools:
                     sent_role = False
                     streamed_len = 0
-                    async for item in _stream_items_with_keepalive(client, qwen_model, current_prompt, has_custom_tools=False, exclude_accounts=excluded_accounts):
+                    async for item in _stream_items_with_keepalive(client, qwen_model, current_prompt, has_custom_tools=False, exclude_accounts=excluded_accounts, uploaded_files=uploaded_files_for_vision):
                         if item["type"] == "keepalive":
                             yield ": keepalive\n\n"
                             continue
@@ -313,7 +355,7 @@ async def chat_completions(request: Request):
                     return
 
                 # ── 有工具：缓冲完整响应后解析工具调用（原逻辑）──────────────
-                async for item in _stream_items_with_keepalive(client, qwen_model, current_prompt, has_custom_tools=bool(tools), exclude_accounts=excluded_accounts):
+                async for item in _stream_items_with_keepalive(client, qwen_model, current_prompt, has_custom_tools=bool(tools), exclude_accounts=excluded_accounts, uploaded_files=uploaded_files_for_vision):
                     if item["type"] == "keepalive":
                         yield ": keepalive\n\n"
                         continue
@@ -494,7 +536,17 @@ async def chat_completions(request: Request):
                 chat_id = None
                 acc = None
                 
-                async for item in client.chat_stream_events_with_retry(qwen_model, current_prompt, has_custom_tools=bool(tools), exclude_accounts=excluded_accounts):
+                # 上传图片以供多模态对话使用
+                if image_urls_for_vision and not uploaded_files_for_vision:
+                    upload_acc = await client.account_pool.acquire_wait(timeout=30)
+                    if not upload_acc:
+                        raise RuntimeError("No account available for uploading images")
+                    try:
+                        uploaded_files_for_vision = await process_image_urls(image_urls_for_vision, client, upload_acc.token)
+                    finally:
+                        client.account_pool.release(upload_acc)
+
+                async for item in client.chat_stream_events_with_retry(qwen_model, current_prompt, has_custom_tools=bool(tools), exclude_accounts=excluded_accounts, uploaded_files=uploaded_files_for_vision):
                     if item["type"] == "meta":
                         chat_id = item["chat_id"]
                         acc = item["acc"]

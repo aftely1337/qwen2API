@@ -447,7 +447,7 @@ class QwenClient:
                 })
         return parsed
 
-    async def chat_stream_events_with_retry(self, model: str, content: str, has_custom_tools: bool = False, exclude_accounts: Optional[set[str]] = None):
+    async def chat_stream_events_with_retry(self, model: str, content: str, has_custom_tools: bool = False, exclude_accounts: Optional[set[str]] = None, uploaded_files: list = None):
         """无感容灾重试逻辑：上游挂了自动换号"""
         exclude = set(exclude_accounts or set())
         for attempt in range(settings.MAX_RETRIES):
@@ -473,7 +473,10 @@ class QwenClient:
                     await asyncio.sleep(wait_s)
                 chat_id = await self.create_chat(acc.token, model)
                 self.active_chat_ids.add(chat_id)
-                payload = self._build_payload(chat_id, model, content, has_custom_tools)
+                if uploaded_files:
+                    payload = self._build_payload_with_files(chat_id, model, content, uploaded_files)
+                else:
+                    payload = self._build_payload(chat_id, model, content, has_custom_tools)
                 log.info(
                     f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 已创建会话：account={acc.email} chat_id={chat_id} "
                     f"engine={self.engine.__class__.__name__} function_calling={payload['messages'][0]['feature_config'].get('function_calling')} "
@@ -554,6 +557,24 @@ class QwenClient:
                 log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 账号失败，准备重试：account={acc.email} error={e}")
                 
         raise Exception(f"All {settings.MAX_RETRIES} attempts failed. Please check upstream accounts.")
+
+    async def chat_with_retry(self, model: str, content: str, has_custom_tools: bool = False, exclude_accounts: Optional[set[str]] = None, uploaded_files: list = None):
+        """一次性返回所有对话结果"""
+        events = []
+        chat_id_out = None
+        acc_out = None
+        async for item in self.chat_stream_events_with_retry(model, content, has_custom_tools, exclude_accounts, uploaded_files):
+            if item["type"] == "meta":
+                chat_id_out = item["chat_id"]
+                acc_out = item["acc"]
+            elif item["type"] == "event":
+                events.append(item["event"])
+        
+        answer_text = ""
+        for evt in events:
+            if evt.get("type") == "delta":
+                answer_text += evt.get("content", "")
+        return answer_text, acc_out, chat_id_out
 
     async def vision_chat_with_retry(self, model: str, prompt: str, uploaded_files: list[dict], pre_acquired_acc: Optional["Account"] = None) -> tuple[str, "Account", str]:
         exclude: set[str] = set()
