@@ -83,6 +83,8 @@ JS_STREAM_FULL = (
     "}}"
 )
 
+import os
+
 _CAMOUFOX_OPTS = {
     "headless": True,
     "humanize": True,               # 启用人类化延迟，行为更自然
@@ -91,10 +93,8 @@ _CAMOUFOX_OPTS = {
     "locale": "zh-CN",              # 中文用户语言
     "firefox_user_prefs": {
         "media.hardware-video-decoding.enabled": False,  # 服务器无 GPU，仅关闭硬件视频解码
-        "gfx.webrender.all": True,
-        "gfx.webrender.software": True, # Force software WebRender
-        # Disable sandbox to avoid issues in container
-        "security.sandbox.content.level": 0,
+        # 用软件 WebRender 替代完全禁用，真实机器通常开启 WebRender
+        "gfx.webrender.software": True,
         # 启用缓存，更像真实用户
         "browser.cache.disk.enable": True,
         "browser.cache.memory.enable": True,
@@ -103,11 +103,6 @@ _CAMOUFOX_OPTS = {
         "browser.shell.checkDefaultBrowser": False,
     },
 }
-
-import os
-if os.environ.get("DOCKER_CONTAINER"):
-    # If inside docker, ensure camoufox runs without sandbox or xvfb issues if possible
-    os.environ["MOZ_DISABLE_CONTENT_SANDBOX"] = "1"
 
 @asynccontextmanager
 async def _new_browser():

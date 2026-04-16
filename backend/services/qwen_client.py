@@ -559,12 +559,12 @@ class QwenClient:
                     exclude.add(acc.email)
                     should_save = True
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 标记为封禁：account={acc.email} error={e}")
-                elif _is_auth_error(err_msg) or "unauthorized" in err_msg or "expired" in err_msg or "token" in err_msg or "login" in err_msg:
+                elif _is_auth_error(err_msg) or "unauthorized" in err_msg or "expired" in err_msg or "token" in err_msg or "login" in err_msg or "401" in err_msg or "403" in err_msg:
                     self.account_pool.mark_invalid(acc, reason="auth_error", error_message=str(e))
                     exclude.add(acc.email)
                     should_save = True
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 标记为鉴权失败：account={acc.email} error={e}")
-                    # asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
+                    asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
                 else:
                     acc.last_error = str(e)
                     exclude.add(acc.email)
@@ -634,7 +634,7 @@ class QwenClient:
                     if chunk_result.get("status") == 429:
                         raise Exception("Engine Queue Full")
                     if chunk_result.get("status") not in (200, "streamed"):
-                        raise Exception(f"HTTP {chunk_result['status']}: {chunk_result.get('body', '')[:200]}")
+                        raise Exception(f"HTTP {chunk_result.get('status')}: {chunk_result.get('body', '')[:200]}")
 
                     raw = ""
                     if "chunk" in chunk_result:
@@ -767,7 +767,7 @@ class QwenClient:
                     if chunk_result.get("status") == 429:
                         raise Exception("Engine Queue Full")
                     if chunk_result.get("status") not in (200, "streamed"):
-                        raise Exception(f"HTTP {chunk_result['status']}: {chunk_result.get('body', '')[:200]}")
+                        raise Exception(f"HTTP {chunk_result.get('status')}: {chunk_result.get('body', '')[:200]}")
 
                     # 把原始文本拼进 buffer
                     raw = ""

@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     REGISTER_SECRET: str = os.getenv("REGISTER_SECRET", "")
 
     # 引擎模式：httpx（快速直连）、browser（浏览器指纹，防封）或 hybrid（混合）
-    ENGINE_MODE: str = os.getenv("ENGINE_MODE", "hybrid")
+    ENGINE_MODE: str = os.getenv("ENGINE_MODE", "httpx")
     NATIVE_TOOL_PASSTHROUGH: bool = os.getenv("NATIVE_TOOL_PASSTHROUGH", "true").lower() in ("1", "true", "yes", "on")
     # 浏览器引擎配置
     BROWSER_POOL_SIZE: int = int(os.getenv("BROWSER_POOL_SIZE", 2))
