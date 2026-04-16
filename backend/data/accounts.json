@@ -1,1 +1,13 @@
-[]
+[
+  {
+    "email": "user@example.com",
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6ImE3OGMyNDYyLWM2YTgtNGI0Yi04OWE3LWNkYTA2MzJjMjM4MCIsImxhc3RfcGFzc3dvcmRfY2hhbmdlIjoxNzc2MzI3MjY1LCJleHAiOjE3Nzg5MTkyODF9.aXOWBSKUWfBB4gzk3ZH1HPY_eWtiN6Lti_v6h7HEtUk",
+    "password": "test",
+    "is_valid": true,
+    "last_used": 0,
+    "inflight": 0,
+    "activation_pending": false,
+    "created_at": 1712534400,
+    "rate_limited_until": 0
+  }
+]
