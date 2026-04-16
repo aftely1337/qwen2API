@@ -192,7 +192,8 @@ class QwenClient:
         }
         
         try:
-            async with httpx.AsyncClient(timeout=30) as hc:
+            # 增加 httpx 上传请求超时至 120 秒，适配大文件及慢网速
+            async with httpx.AsyncClient(timeout=120.0) as hc:
                 resp = await hc.post(
                     f"{BASE_URL}/api/v1/files/",
                     headers=headers,

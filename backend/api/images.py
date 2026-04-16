@@ -167,8 +167,8 @@ async def edit_image(
 
     log.info(f"[T2I-Edit] Real mode: model={model_resolved}, n={n_limit}, prompt={prompt[:80]!r}")
     
-    # 1. 拿出一个可用账号，以便进行上传
-    acc = await client.account_pool.acquire_wait(timeout=10)
+    # 1. 拿出一个可用账号，以便进行上传。等待时间调长以防止并发高峰导致 503
+    acc = await client.account_pool.acquire_wait(timeout=30)
     if not acc:
         raise HTTPException(status_code=503, detail="No available accounts for uploading.")
         
