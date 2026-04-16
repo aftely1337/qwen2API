@@ -199,7 +199,7 @@ async def edit_image(
             async for item in client.chat_stream_events_with_retry(
                 model_resolved,
                 prompt_text,
-                has_custom_tools=False,
+                has_custom_tools=False, is_image_edit=True,
                 files=[remote_ref],
                 fixed_account=acc
             ):
@@ -227,6 +227,7 @@ async def edit_image(
             log.info(f"[T2I-Edit] 提取到 {len(image_urls)} 张图片 URL: {image_urls}")
 
             if not image_urls:
+                log.error(f"[T2I-Edit] Answer text: {answer_text}")
                 raise HTTPException(status_code=500, detail="Image edit succeeded but no URL found")
 
             data = [{"url": url, "revised_prompt": prompt} for url in image_urls[:n_limit]]

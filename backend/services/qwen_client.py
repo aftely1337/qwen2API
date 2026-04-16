@@ -142,13 +142,13 @@ class QwenClient:
         has_custom_tools: bool = False,
         files: list[dict] | None = None,
         fixed_account=None,
-        existing_chat_id: str | None = None,
+        existing_chat_id: str | None = None, is_image_edit: bool = False
     ):
         async for item in self.executor.chat_stream_events_with_retry(
             model,
             content,
             has_custom_tools,
-            files=files,
+            files=files, is_image_edit=is_image_edit,
             fixed_account=fixed_account,
             existing_chat_id=existing_chat_id,
         ):

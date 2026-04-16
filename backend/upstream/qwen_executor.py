@@ -85,12 +85,13 @@ class QwenExecutor:
         content: str,
         has_custom_tools: bool = False,
         files: list[dict] | None = None,
+        is_image_edit: bool = False,
     ):
         stream_fn = getattr(self.engine, "stream_chat_once", None) or getattr(self.engine, "fetch_chat", None)
         if stream_fn is None:
             raise Exception("stream transport unavailable")
 
-        payload = build_chat_payload(chat_id, model, content, has_custom_tools, files=files)
+        payload = build_chat_payload(chat_id, model, content, has_custom_tools, files=files, is_image_edit=is_image_edit)
         buffer = ""
         started_at = time.perf_counter()
         first_event_logged = False
@@ -160,6 +161,7 @@ class QwenExecutor:
         files: list[dict] | None = None,
         fixed_account=None,
         existing_chat_id: str | None = None,
+        is_image_edit: bool = False
     ):
         exclude = set()
         if fixed_account is not None:
@@ -174,7 +176,7 @@ class QwenExecutor:
                 else:
                     log.info(f"[Executor] created chat_id={chat_id} account={acc.email}")
                 yield {"type": "meta", "chat_id": chat_id, "acc": acc}
-                async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files):
+                async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files, is_image_edit=is_image_edit):
                     yield {"type": "event", "event": evt}
                 return
             except Exception:
@@ -194,7 +196,7 @@ class QwenExecutor:
                 log.info(f"[Executor] created chat_id={chat_id} account={acc.email}")
                 yield {"type": "meta", "chat_id": chat_id, "acc": acc}
 
-                async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files):
+                async for evt in self.stream(acc.token, chat_id, model, content, has_custom_tools, files=files, is_image_edit=is_image_edit):
                     yield {"type": "event", "event": evt}
                 return
 

@@ -20,7 +20,7 @@ CUSTOM_TOOL_LOW_LATENCY_OVERRIDES = {
 }
 
 
-def build_chat_payload(chat_id: str, model: str, content: str, has_custom_tools: bool = False, files: list[dict] | None = None) -> dict:
+def build_chat_payload(chat_id: str, model: str, content: str, has_custom_tools: bool = False, files: list[dict] | None = None, is_image_edit: bool = False) -> dict:
     ts = int(time.time())
     feature_config = {
         **CUSTOM_TOOL_COMPAT_FEATURE_CONFIG,
@@ -35,6 +35,15 @@ def build_chat_payload(chat_id: str, model: str, content: str, has_custom_tools:
         "enable_function_call": False,
         "tool_choice": "none",
     }
+    if is_image_edit or (files and any("image" in str(f.get("file_type", "")).lower() for f in files)):
+        # For image generation or editing, we must enable tools
+        feature_config["enable_tools"] = True
+        feature_config["plugins_enabled"] = True
+        # For text to image: tool is image_gen. For image to image: tool is image_edit_tool
+        feature_config["tool_choice"] = "auto"
+        # Ensure we don't disable function calling totally if we need native tools
+        # We can let Qwen use its native tools for image processing
+
     return {
         "stream": True,
         "version": "2.1",
