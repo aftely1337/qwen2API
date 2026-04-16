@@ -201,6 +201,7 @@ async def edit_image(
         except Exception as e:
             err_msg = str(e).lower()
             if "quota exceeded" in err_msg or "allocated quota exceeded" in err_msg or "token-limit" in err_msg:
+                log.warning("[T2I-Edit] 上游图像编辑配额不足，回退为：识图 -> 文生图")
                 desc_text, used_acc, desc_chat_id = await client.vision_chat_with_retry(
                     model_resolved,
                     "请描述这张图片的主要内容和构图细节（尽量客观、简洁）。",
@@ -225,6 +226,7 @@ async def edit_image(
 
         lower_text = answer_text.lower()
         if "allocated quota exceeded" in lower_text or "quota exceeded" in lower_text or "token-limit" in lower_text:
+            log.warning("[T2I-Edit] 上游返回配额不足提示，回退为：识图 -> 文生图")
             desc_text, used_acc, desc_chat_id = await client.vision_chat_with_retry(
                 model_resolved,
                 "请描述这张图片的主要内容和构图细节（尽量客观、简洁）。",

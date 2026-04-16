@@ -369,6 +369,48 @@ class QwenClient:
             "timestamp": ts,
         }
 
+    def _build_image_edit_payload(self, chat_id: str, model: str, prompt: str, uploaded_files: list[dict]) -> dict:
+        ts = int(time.time())
+        feature_config = {
+            "thinking_enabled": False,
+            "output_schema": "phase",
+            "research_mode": "normal",
+            "auto_thinking": False,
+            "thinking_mode": "off",
+            "thinking_format": "summary",
+            "auto_search": False,
+            "code_interpreter": False,
+            "function_calling": False,
+            "plugins_enabled": True,
+            "image_generation": True,
+        }
+        return {
+            "stream": True,
+            "version": "2.1",
+            "incremental_output": True,
+            "chat_id": chat_id,
+            "chat_mode": "normal",
+            "model": model,
+            "parent_id": None,
+            "messages": [{
+                "fid": str(uuid.uuid4()),
+                "parentId": None,
+                "childrenIds": [str(uuid.uuid4())],
+                "role": "user",
+                "content": prompt,
+                "user_action": "chat",
+                "files": uploaded_files or [],
+                "timestamp": ts,
+                "models": [model],
+                "chat_type": "image_edit",
+                "feature_config": feature_config,
+                "extra": {"meta": {"subChatType": "image_edit", "mode": "image_edit"}},
+                "sub_chat_type": "image_edit",
+                "parent_id": None,
+            }],
+            "timestamp": ts,
+        }
+
     def parse_sse_chunk(self, chunk: str) -> list[dict]:
         events = []
         for line in chunk.splitlines():
@@ -656,9 +698,13 @@ class QwenClient:
 
             chat_id: Optional[str] = None
             try:
-                chat_id = await self.create_chat(acc.token, model, chat_type="t2t")
+                chat_id = await self.create_chat(acc.token, model, chat_type="image_edit" if uploaded_files else "t2t")
                 self.active_chat_ids.add(chat_id)
-                payload = self._build_image_payload(chat_id, model, prompt, uploaded_files=uploaded_files)
+                payload = (
+                    self._build_image_edit_payload(chat_id, model, prompt, uploaded_files or [])
+                    if uploaded_files
+                    else self._build_image_payload(chat_id, model, prompt, uploaded_files=None)
+                )
 
                 raw_body_parts: list[str] = []  # 保存原始 SSE body 用于 debug
                 answer_text = ""
