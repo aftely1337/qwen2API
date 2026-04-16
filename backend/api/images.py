@@ -119,6 +119,11 @@ async def create_image(request: Request):
         answer_text = "\n".join(event_payloads)
         if current_chat:
             answer_text += "\n" + json.dumps(current_chat, ensure_ascii=False)
+            
+        lower_text = answer_text.lower()
+        if "allocated quota exceeded" in lower_text or "quota exceeded" in lower_text or "token-limit" in lower_text:
+            raise Exception("Image Generation Quota Exceeded")
+            
         image_urls = _extract_image_urls(answer_text)
         log.info(f"[T2I] 提取到 {len(image_urls)} 张图片 URL: {image_urls}")
 
@@ -131,6 +136,10 @@ async def create_image(request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        err_msg = str(e).lower()
+        if "quota exceeded" in err_msg or "allocated quota exceeded" in err_msg or "token-limit" in err_msg:
+            if acc:
+                client.account_pool.mark_rate_limited(acc, error_message="Image Generation Quota Exceeded")
         log.error(f"[T2I] 生成失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -210,6 +219,10 @@ async def edit_image(
             if current_chat:
                 answer_text += "\n" + json.dumps(current_chat, ensure_ascii=False)
 
+            lower_text = answer_text.lower()
+            if "allocated quota exceeded" in lower_text or "quota exceeded" in lower_text or "token-limit" in lower_text:
+                raise Exception("Image Edit Quota Exceeded")
+
             image_urls = _extract_image_urls(answer_text)
             log.info(f"[T2I-Edit] 提取到 {len(image_urls)} 张图片 URL: {image_urls}")
 
@@ -226,7 +239,12 @@ async def edit_image(
         except HTTPException:
             raise
         except Exception as e:
-            log.warning(f"[T2I-Edit] 尝试 {attempt+1}/{settings.MAX_RETRIES} 失败: {e}")
+            err_msg = str(e).lower()
+            if "quota exceeded" in err_msg or "allocated quota exceeded" in err_msg or "token-limit" in err_msg:
+                log.warning(f"[T2I-Edit] 账号 {acc.email} 图像编辑配额不足，标记限流并换号重试")
+                client.account_pool.mark_rate_limited(acc, error_message="Image Edit Quota Exceeded")
+            else:
+                log.warning(f"[T2I-Edit] 尝试 {attempt+1}/{settings.MAX_RETRIES} 失败: {e}")
             last_error = e
         finally:
             client.account_pool.release(acc)

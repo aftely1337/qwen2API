@@ -211,8 +211,8 @@ class QwenExecutor:
                 if is_timeout:
                     log.warning(f"[Executor] timeout detected attempt={attempt + 1}/{settings.MAX_RETRIES} account={acc.email} error={e}")
                     exclude.add(acc.email)
-                elif "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg:
-                    self.account_pool.mark_rate_limited(acc)
+                elif "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg or "quota exceeded" in err_msg or "token-limit" in err_msg:
+                    self.account_pool.mark_rate_limited(acc, error_message=err_msg)
                     exclude.add(acc.email)
                 elif "unauthorized" in err_msg or "401" in err_msg or "403" in err_msg:
                     self.account_pool.mark_invalid(acc)
