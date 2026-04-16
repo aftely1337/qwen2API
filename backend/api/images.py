@@ -168,97 +168,68 @@ async def edit_image(
         if token != settings.ADMIN_KEY and token not in API_KEYS:
             raise HTTPException(status_code=401, detail="Invalid API Key")
 
+    # 1. 重试循环：如果配额不足则换账号重试
     n_limit = min(max(n, 1), 4)
     model_resolved = _resolve_image_model(model)
 
     log.info(f"[T2I-Edit] Real mode: model={model_resolved}, n={n_limit}, prompt={prompt[:80]!r}")
     
-    # 1. 拿出一个可用账号，以便进行上传。等待时间调长以防止并发高峰导致 503
-    acc = await client.account_pool.acquire_wait(timeout=30)
-    if not acc:
-        raise HTTPException(status_code=503, detail="No available accounts for uploading.")
-        
-    try:
-        # 2. 上传原图到千问的 /api/v1/files/
-        image_bytes = await image.read()
-        filename = image.filename or "image.png"
-        content_type = image.content_type or "image/png"
-        
-        uploaded_file_info = await client.upload_file(acc.token, image_bytes, filename, content_type)
-        
-        # TODO: 暂时忽略 mask 遮罩文件，千问可能不需要分离的遮罩，或者需要另外拼图。这里只上传主图。
-        
-        answer_text = ""
-        used_acc = acc
-        chat_id = ""
+    image_bytes = await image.read()
+    filename = image.filename or "image.png"
+    content_type = image.content_type or "image/png"
+    
+    last_error = None
+    for attempt in range(settings.MAX_RETRIES):
+        acc = await client.account_pool.acquire_wait(timeout=30)
+        if not acc:
+            raise HTTPException(status_code=503, detail="No available accounts for uploading.")
+            
         try:
+            # 2. 上传原图到千问的 /api/v1/files/
+            uploaded_file_info = await client.upload_file(acc.token, image_bytes, filename, content_type)
+            
+            # TODO: 暂时忽略 mask 遮罩文件，千问可能不需要分离的遮罩，或者需要另外拼图。这里只上传主图。
+            
+            answer_text = ""
+            chat_id = ""
+            
             answer_text, used_acc, chat_id = await client.image_generate_with_retry(
                 model_resolved,
                 prompt,
                 uploaded_files=[uploaded_file_info],
                 pre_acquired_acc=acc
             )
+
+            if chat_id:
+                asyncio.create_task(client.delete_chat(used_acc.token, chat_id))
+
+            if not answer_text:
+                raise Exception("Empty upstream response")
+
+            lower_text = answer_text.lower()
+            if "allocated quota exceeded" in lower_text or "quota exceeded" in lower_text or "token-limit" in lower_text:
+                raise Exception("Image Edit Quota Exceeded")
+
+            image_urls = _extract_image_urls(answer_text)
+            log.info(f"[T2I-Edit] 提取到 {len(image_urls)} 张图片 URL: {[_redact_url_query(u) for u in image_urls]}")
+
+            if not image_urls:
+                log.warning(f"[T2I-Edit] 未能提取图片 URL，原始响应: {answer_text[:300]!r}")
+                raise Exception(f"Image edit generation succeeded but no URL found. Raw response: {answer_text[:200]}")
+
+            data = [{"url": url, "revised_prompt": prompt} for url in image_urls[:n_limit]]
+            return JSONResponse({"created": int(time.time()), "data": data})
+
         except Exception as e:
             err_msg = str(e).lower()
             if "quota exceeded" in err_msg or "allocated quota exceeded" in err_msg or "token-limit" in err_msg:
-                log.warning("[T2I-Edit] 上游图像编辑配额不足，回退为：识图 -> 文生图")
-                desc_text, used_acc, desc_chat_id = await client.vision_chat_with_retry(
-                    model_resolved,
-                    "请描述这张图片的主要内容和构图细节（尽量客观、简洁）。",
-                    uploaded_files=[uploaded_file_info],
-                    pre_acquired_acc=acc
-                )
-                asyncio.create_task(client.delete_chat(used_acc.token, desc_chat_id))
-                combined_prompt = f"基于这张图片的描述：{desc_text}\n编辑要求：{prompt}"
-                answer_text, used_acc, chat_id = await client.image_generate_with_retry(
-                    model_resolved,
-                    combined_prompt,
-                    pre_acquired_acc=acc
-                )
+                log.warning(f"[T2I-Edit] 账号 {acc.email} 图像编辑配额不足，标记限流并换号重试")
+                client.account_pool.mark_rate_limited(acc, cooldown=3600, error_message="Image Edit Quota Exceeded")
             else:
-                raise
+                log.warning(f"[T2I-Edit] 尝试 {attempt+1}/{settings.MAX_RETRIES} 失败: {e}")
+            last_error = e
+        finally:
+            client.account_pool.release(acc)
 
-        if chat_id:
-            asyncio.create_task(client.delete_chat(used_acc.token, chat_id))
-
-        if not answer_text:
-            raise HTTPException(status_code=500, detail="Empty upstream response")
-
-        lower_text = answer_text.lower()
-        if "allocated quota exceeded" in lower_text or "quota exceeded" in lower_text or "token-limit" in lower_text:
-            log.warning("[T2I-Edit] 上游返回配额不足提示，回退为：识图 -> 文生图")
-            desc_text, used_acc, desc_chat_id = await client.vision_chat_with_retry(
-                model_resolved,
-                "请描述这张图片的主要内容和构图细节（尽量客观、简洁）。",
-                uploaded_files=[uploaded_file_info],
-                pre_acquired_acc=acc
-            )
-            asyncio.create_task(client.delete_chat(used_acc.token, desc_chat_id))
-            combined_prompt = f"基于这张图片的描述：{desc_text}\n编辑要求：{prompt}"
-            answer_text, used_acc, chat_id2 = await client.image_generate_with_retry(
-                model_resolved,
-                combined_prompt,
-                pre_acquired_acc=acc
-            )
-            asyncio.create_task(client.delete_chat(used_acc.token, chat_id2))
-
-        image_urls = _extract_image_urls(answer_text)
-        log.info(f"[T2I-Edit] 提取到 {len(image_urls)} 张图片 URL: {[_redact_url_query(u) for u in image_urls]}")
-
-        if not image_urls:
-            log.warning(f"[T2I-Edit] 未能提取图片 URL，原始响应: {answer_text[:300]!r}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Image edit generation succeeded but no URL found. Raw response: {answer_text[:200]}"
-            )
-
-        data = [{"url": url, "revised_prompt": prompt} for url in image_urls[:n_limit]]
-        return JSONResponse({"created": int(time.time()), "data": data})
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"[T2I-Edit] 生成失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        client.account_pool.release(acc)
+    log.error(f"[T2I-Edit] 所有 {settings.MAX_RETRIES} 次尝试均失败。最后错误: {last_error}")
+    raise HTTPException(status_code=500, detail=str(last_error))

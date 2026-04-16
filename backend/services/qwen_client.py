@@ -778,6 +778,10 @@ class QwenClient:
                 if not answer_text:
                     answer_text = raw_body
 
+                lower_text = answer_text.lower()
+                if "allocated quota exceeded" in lower_text or "quota exceeded" in lower_text or "token-limit" in lower_text:
+                    raise Exception("Image Generation Quota Exceeded")
+
                 self.active_chat_ids.discard(chat_id)
                 log.info(f"[T2I] 生成完成，响应长度={len(answer_text)}: {self._redact_urls_in_text(answer_text[:200])!r}")
                 return answer_text, acc, chat_id
@@ -786,7 +790,7 @@ class QwenClient:
                 if chat_id:
                     self.active_chat_ids.discard(chat_id)  # type: ignore[arg-type]
                 err_msg = str(e).lower()
-                if "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg:
+                if "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg or "quota exceeded" in err_msg or "token-limit" in err_msg:
                     self.account_pool.mark_rate_limited(acc, error_message=str(e))
                 elif _is_pending_activation_error(err_msg):
                     self.account_pool.mark_invalid(acc, reason="pending_activation", error_message=str(e))
@@ -797,8 +801,6 @@ class QwenClient:
                     self.account_pool.mark_invalid(acc, reason="auth_error", error_message=str(e))
                     asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
                     exclude.add(acc.email)
-                elif "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg:
-                    pass  # already handled above, mark_rate_limited excludes implicitly
                 log.warning(f"[T2I Retry {attempt+1}/{settings.MAX_RETRIES}] Account {acc.email} failed: {e}")
                 
                 # 如果是外部传入的账号且失败了，直接抛出异常，不再内部死循环重试
