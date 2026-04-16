@@ -175,6 +175,47 @@ class QwenClient:
         except Exception:
             return []
 
+    async def upload_file(self, token: str, file_content: bytes, filename: str, content_type: str = "image/png") -> dict:
+        """上传文件（图片）到千问官方的 /api/v1/files/ 接口，返回 file_id。"""
+        import httpx
+        from backend.services.auth_resolver import BASE_URL
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://chat.qwen.ai/",
+            "Origin": "https://chat.qwen.ai",
+        }
+        
+        # httpx 组装 multipart/form-data
+        files = {
+            "file": (filename, file_content, content_type)
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=30) as hc:
+                resp = await hc.post(
+                    f"{BASE_URL}/api/v1/files/",
+                    headers=headers,
+                    files=files
+                )
+            if resp.status_code != 200:
+                log.warning(f"[upload_file] HTTP {resp.status_code}: {resp.text[:100]}")
+                raise Exception(f"Upload failed: HTTP {resp.status_code}")
+                
+            data = resp.json()
+            if "id" not in data:
+                raise Exception(f"Upload failed: Missing file 'id' in response. {data}")
+                
+            log.info(f"[upload_file] 成功上传文件: {filename}, file_id: {data['id']}")
+            return {
+                "file_id": data["id"],
+                "file_name": data.get("filename", filename),
+                "content_type": content_type
+            }
+        except Exception as e:
+            log.error(f"[upload_file] 文件上传出错: {e}")
+            raise
+
     def _build_payload(self, chat_id: str, model: str, content: str, has_custom_tools: bool = False) -> dict:
         ts = int(time.time())
         # 有工具时关闭思考模式——工具调用只需要输出结构化 JSON，思考会白白浪费几十秒
@@ -203,7 +244,7 @@ class QwenClient:
             "timestamp": ts,
         }
 
-    def _build_image_payload(self, chat_id: str, model: str, prompt: str) -> dict:
+    def _build_image_payload(self, chat_id: str, model: str, prompt: str, uploaded_files: list[dict] = None) -> dict:
         ts = int(time.time())
         feature_config = {
             "thinking_enabled": False,
@@ -217,6 +258,15 @@ class QwenClient:
             "image_generation": True,
             "default_aspect_ratio": "16:9",
         }
+        files_array = []
+        if uploaded_files:
+            for f in uploaded_files:
+                files_array.append({
+                    "file_id": f["file_id"],
+                    "file_name": f["file_name"],
+                    "content_type": f["content_type"]
+                })
+        
         return {
             "stream": True,
             "version": "2.1",
@@ -232,10 +282,10 @@ class QwenClient:
                 "role": "user",
                 "content": prompt,
                 "user_action": "chat",
-                "files": [],
+                "files": files_array,
                 "timestamp": ts,
                 "models": [model],
-                "chat_type": "t2t",
+                "chat_type": "t2i",
                 "feature_config": feature_config,
                 "extra": {"meta": {"subChatType": "t2i", "mode": "image_generation", "aspectRatio": "16:9"}},
                 "sub_chat_type": "t2i",
@@ -432,7 +482,7 @@ class QwenClient:
                                 urls.append(sub_val)
         return urls
 
-    async def image_generate_with_retry(self, model: str, prompt: str, exclude_accounts: Optional[set[str]] = None) -> tuple[str, "Account", str]:
+    async def image_generate_with_retry(self, model: str, prompt: str, exclude_accounts: Optional[set[str]] = None, uploaded_files: list[dict] = None) -> tuple[str, "Account", str]:
         """调用千问 T2I 生成图片，返回 (原始响应文本, 使用的账号, chat_id)"""
         exclude = set(exclude_accounts or set())
         for attempt in range(settings.MAX_RETRIES):
@@ -448,7 +498,7 @@ class QwenClient:
             try:
                 chat_id = await self.create_chat(acc.token, model, chat_type="t2i")
                 self.active_chat_ids.add(chat_id)
-                payload = self._build_image_payload(chat_id, model, prompt)
+                payload = self._build_image_payload(chat_id, model, prompt, uploaded_files=uploaded_files)
 
                 raw_body_parts: list[str] = []  # 保存原始 SSE body 用于 debug
                 answer_text = ""

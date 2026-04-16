@@ -151,9 +151,7 @@ async def edit_image(
 ):
     """
     OpenAI 兼容的图片编辑（图生图/局部重绘）接口。
-    当前后端底层封装的是免费千问网页版，暂不支持真正的图片上传与重绘。
-    本接口目前作为前端对接测试的降级处理：忽略传入的原图和遮罩，直接根据 prompt 生成全新图片。
-    未来可在此处接入官方 API 实现真实图生图能力。
+    上传图片至千问后端获取 file_id，并将图生图任务下发。
     """
     from backend.core.config import API_KEYS, settings
     client: QwenClient = request.app.state.qwen_client
@@ -167,17 +165,33 @@ async def edit_image(
     n_limit = min(max(n, 1), 4)
     model_resolved = _resolve_image_model(model)
 
-    log.info(f"[T2I-Edit] Fallback mode: model={model_resolved}, n={n_limit}, prompt={prompt[:80]!r}")
+    log.info(f"[T2I-Edit] Real mode: model={model_resolved}, n={n_limit}, prompt={prompt[:80]!r}")
     
-    # 模拟降级处理：将编辑请求直接转化为生图请求
-    fallback_prompt = f"请注意：用户原意是使用图生图功能修改图片，但系统当前以降级模式工作，忽略了原图。请仅基于以下提示词生成全新的图片：\n{prompt}"
-    
+    # 1. 拿出一个可用账号，以便进行上传
+    acc = await client.account_pool.acquire_wait(timeout=10)
+    if not acc:
+        raise HTTPException(status_code=503, detail="No available accounts for uploading.")
+        
     try:
-        answer_text, acc, chat_id = await client.image_generate_with_retry(model_resolved, fallback_prompt)
+        # 2. 上传原图到千问的 /api/v1/files/
+        image_bytes = await image.read()
+        filename = image.filename or "image.png"
+        content_type = image.content_type or "image/png"
+        
+        uploaded_file_info = await client.upload_file(acc.token, image_bytes, filename, content_type)
+        
+        # TODO: 暂时忽略 mask 遮罩文件，千问可能不需要分离的遮罩，或者需要另外拼图。这里只上传主图。
+        
+        # 3. 携带上传文件发起图生图生成
+        answer_text, used_acc, chat_id = await client.image_generate_with_retry(
+            model_resolved, 
+            prompt,
+            uploaded_files=[uploaded_file_info]
+        )
 
         # 后台清理会话
-        client.account_pool.release(acc)
-        asyncio.create_task(client.delete_chat(acc.token, chat_id))
+        client.account_pool.release(used_acc)
+        asyncio.create_task(client.delete_chat(used_acc.token, chat_id))
 
         # 提取图片 URL
         image_urls = _extract_image_urls(answer_text)
@@ -198,3 +212,5 @@ async def edit_image(
     except Exception as e:
         log.error(f"[T2I-Edit] 生成失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        client.account_pool.release(acc)
