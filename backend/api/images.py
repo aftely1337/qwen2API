@@ -8,7 +8,7 @@ import re
 import time
 import asyncio
 import logging
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, Request, HTTPException, File, UploadFile, Form
 from fastapi.responses import JSONResponse
 from backend.services.qwen_client import QwenClient
 
@@ -136,4 +136,65 @@ async def create_image(request: Request):
         raise
     except Exception as e:
         log.error(f"[T2I] 生成失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/v1/images/edits")
+@router.post("/images/edits")
+async def edit_image(
+    request: Request,
+    image: UploadFile = File(...),
+    mask: UploadFile = File(None),
+    prompt: str = Form(...),
+    n: int = Form(1),
+    size: str = Form("1024x1024"),
+    model: str = Form("dall-e-3")
+):
+    """
+    OpenAI 兼容的图片编辑（图生图/局部重绘）接口。
+    当前后端底层封装的是免费千问网页版，暂不支持真正的图片上传与重绘。
+    本接口目前作为前端对接测试的降级处理：忽略传入的原图和遮罩，直接根据 prompt 生成全新图片。
+    未来可在此处接入官方 API 实现真实图生图能力。
+    """
+    from backend.core.config import API_KEYS, settings
+    client: QwenClient = request.app.state.qwen_client
+
+    # 鉴权
+    token = _get_token(request)
+    if API_KEYS:
+        if token != settings.ADMIN_KEY and token not in API_KEYS:
+            raise HTTPException(status_code=401, detail="Invalid API Key")
+
+    n_limit = min(max(n, 1), 4)
+    model_resolved = _resolve_image_model(model)
+
+    log.info(f"[T2I-Edit] Fallback mode: model={model_resolved}, n={n_limit}, prompt={prompt[:80]!r}")
+    
+    # 模拟降级处理：将编辑请求直接转化为生图请求
+    fallback_prompt = f"请注意：用户原意是使用图生图功能修改图片，但系统当前以降级模式工作，忽略了原图。请仅基于以下提示词生成全新的图片：\n{prompt}"
+    
+    try:
+        answer_text, acc, chat_id = await client.image_generate_with_retry(model_resolved, fallback_prompt)
+
+        # 后台清理会话
+        client.account_pool.release(acc)
+        asyncio.create_task(client.delete_chat(acc.token, chat_id))
+
+        # 提取图片 URL
+        image_urls = _extract_image_urls(answer_text)
+        log.info(f"[T2I-Edit] 提取到 {len(image_urls)} 张图片 URL: {image_urls}")
+
+        if not image_urls:
+            log.warning(f"[T2I-Edit] 未能提取图片 URL，原始响应: {answer_text[:300]!r}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Image edit generation succeeded but no URL found. Raw response: {answer_text[:200]}"
+            )
+
+        data = [{"url": url, "revised_prompt": prompt} for url in image_urls[:n_limit]]
+        return JSONResponse({"created": int(time.time()), "data": data})
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"[T2I-Edit] 生成失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
