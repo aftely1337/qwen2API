@@ -9,7 +9,7 @@ import time
 import json
 import asyncio
 import logging
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, Request, HTTPException, File, UploadFile, Form
 from fastapi.responses import JSONResponse
 from backend.services.qwen_client import QwenClient
 
@@ -138,3 +138,98 @@ async def create_image(request: Request):
             client.account_pool.release(acc)
             if chat_id:
                 asyncio.create_task(client.delete_chat(acc.token, chat_id))
+
+
+@router.post("/v1/images/edits")
+@router.post("/images/edits")
+async def edit_image(
+    request: Request,
+    image: UploadFile = File(...),
+    mask: UploadFile | None = File(None),
+    prompt: str = Form(...),
+    n: int = Form(1),
+    size: str = Form("1024x1024"),
+    model: str = Form("dall-e-3")
+):
+    from backend.core.config import API_KEYS, settings
+    client: QwenClient = request.app.state.qwen_client
+    uploader = request.app.state.upstream_file_uploader
+
+    token = _get_token(request)
+    if API_KEYS:
+        if token != settings.ADMIN_KEY and token not in API_KEYS:
+            raise HTTPException(status_code=401, detail="Invalid API Key")
+
+    n_limit = min(max(n, 1), 4)
+    model_resolved = _resolve_image_model(model)
+    log.info(f"[T2I-Edit] model={model_resolved}, n={n_limit}, prompt={prompt[:80]!r}")
+
+    image_bytes = await image.read()
+    filename = image.filename or "image.png"
+    content_type = image.content_type or "image/png"
+
+    # Save to file_store to get local_meta for uploader
+    file_store = request.app.state.file_store
+    local_meta = await file_store.save_bytes(filename, content_type, image_bytes, "vision")
+
+    last_error = None
+    for attempt in range(settings.MAX_RETRIES):
+        acc = await client.account_pool.acquire_wait(timeout=30)
+        if not acc:
+            raise HTTPException(status_code=503, detail="No available accounts for uploading.")
+
+        try:
+            # Upload file
+            remote_info = await uploader.upload_local_file(acc, local_meta)
+            remote_ref = remote_info["remote_ref"]
+
+            prompt_text = _build_image_prompt(prompt)
+            event_payloads: list[str] = []
+            chat_id = None
+
+            async for item in client.chat_stream_events_with_retry(
+                model_resolved,
+                prompt_text,
+                has_custom_tools=False,
+                files=[remote_ref],
+                fixed_account=acc
+            ):
+                if item.get("type") == "meta":
+                    chat_id = item.get("chat_id")
+                    continue
+                if item.get("type") != "event":
+                    continue
+                event_payloads.append(json.dumps(item.get("event", {}), ensure_ascii=False))
+
+            if not chat_id:
+                raise HTTPException(status_code=500, detail="Image generation session was not created")
+
+            chats = await client.list_chats(acc.token, limit=20)
+            current_chat = next((c for c in chats if isinstance(c, dict) and c.get("id") == chat_id), None)
+            answer_text = "\n".join(event_payloads)
+            if current_chat:
+                answer_text += "\n" + json.dumps(current_chat, ensure_ascii=False)
+
+            image_urls = _extract_image_urls(answer_text)
+            log.info(f"[T2I-Edit] 提取到 {len(image_urls)} 张图片 URL: {image_urls}")
+
+            if not image_urls:
+                raise HTTPException(status_code=500, detail="Image edit succeeded but no URL found")
+
+            data = [{"url": url, "revised_prompt": prompt} for url in image_urls[:n_limit]]
+            
+            # Clean up
+            asyncio.create_task(client.delete_chat(acc.token, chat_id))
+            
+            return JSONResponse({"created": int(time.time()), "data": data})
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.warning(f"[T2I-Edit] 尝试 {attempt+1}/{settings.MAX_RETRIES} 失败: {e}")
+            last_error = e
+        finally:
+            client.account_pool.release(acc)
+
+    log.error(f"[T2I-Edit] 所有 {settings.MAX_RETRIES} 次尝试均失败。最后错误: {last_error}")
+    raise HTTPException(status_code=500, detail=str(last_error))

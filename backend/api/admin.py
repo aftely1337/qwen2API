@@ -101,6 +101,23 @@ async def add_account(request: Request):
     return {"ok": True, "email": acc.email}
 
 
+
+@router.post("/reload", dependencies=[Depends(verify_admin)])
+async def reload_accounts(request: Request):
+    """从磁盘重新加载账号数据"""
+    pool = request.app.state.account_pool
+    await pool.load()
+    for acc in pool.accounts:
+        acc.valid = True
+        acc.activation_pending = False
+        acc.status_code = "valid"
+        acc.last_error = ""
+        acc.consecutive_failures = 0
+        acc.rate_limit_strikes = 0
+        acc.rate_limited_until = 0.0
+    await pool.save()
+    return {"ok": True, "count": len(pool.accounts)}
+
 @router.get("/accounts", dependencies=[Depends(verify_admin)])
 async def list_accounts(request: Request):
     pool: AccountPool = request.app.state.account_pool

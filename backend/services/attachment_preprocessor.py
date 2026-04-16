@@ -51,9 +51,11 @@ async def preprocess_attachments(payload: dict[str, Any], file_store, owner_toke
                 continue
             if block.get("type") == "image_url":
                 image_url = block.get("image_url") or {}
-                if isinstance(image_url, dict) and str(image_url.get("url") or "").strip().startswith("data:"):
-                    needs_rewrite = True
-                    break
+                if isinstance(image_url, dict):
+                    url_str = str(image_url.get("url") or "").strip()
+                    if url_str.startswith("data:") or url_str.startswith("http"):
+                        needs_rewrite = True
+                        break
             if block.get("type") in ("input_file", "file") and _extract_inline_file_payload(block):
                 needs_rewrite = True
                 break
@@ -76,9 +78,22 @@ async def preprocess_attachments(payload: dict[str, Any], file_store, owner_toke
                 continue
             if block.get("type") == "image_url":
                 image_url = block.get("image_url") or {}
-                if isinstance(image_url, dict) and str(image_url.get("url") or "").strip().startswith("data:"):
-                    content_type, raw = _decode_data_uri(str(image_url.get("url") or ""))
-                    result = await file_store.save_bytes("inline-image", content_type, raw, "vision", owner_token=owner_token)
+                if isinstance(image_url, dict):
+                    url_str = str(image_url.get("url") or "").strip()
+                    if url_str.startswith("data:"):
+                        content_type, raw = _decode_data_uri(url_str)
+                    elif url_str.startswith("http"):
+                        import httpx
+                        async with httpx.AsyncClient(timeout=10) as hc:
+                            resp = await hc.get(url_str)
+                            resp.raise_for_status()
+                            raw = resp.content
+                            content_type = resp.headers.get("content-type", "image/jpeg")
+                    else:
+                        continue
+                    
+                    ext = content_type.split("/")[-1] if "/" in content_type else "jpg"
+                    result = await file_store.save_bytes(f"vision-image.{ext}", content_type, raw, "vision", owner_token=owner_token)
                     uploaded_file_ids.append(result["id"])
                     attachments.append(NormalizedAttachment(
                         file_id=result["id"],
