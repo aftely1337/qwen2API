@@ -482,11 +482,15 @@ class QwenClient:
                                 urls.append(sub_val)
         return urls
 
-    async def image_generate_with_retry(self, model: str, prompt: str, exclude_accounts: Optional[set[str]] = None, uploaded_files: list[dict] = None) -> tuple[str, "Account", str]:
+    async def image_generate_with_retry(self, model: str, prompt: str, exclude_accounts: Optional[set[str]] = None, uploaded_files: list[dict] = None, pre_acquired_acc: Optional["Account"] = None) -> tuple[str, "Account", str]:
         """调用千问 T2I 生成图片，返回 (原始响应文本, 使用的账号, chat_id)"""
         exclude = set(exclude_accounts or set())
         for attempt in range(settings.MAX_RETRIES):
-            acc = await self.account_pool.acquire_wait(timeout=60, exclude=exclude)
+            if pre_acquired_acc:
+                acc = pre_acquired_acc
+            else:
+                acc = await self.account_pool.acquire_wait(timeout=60, exclude=exclude)
+                
             if not acc:
                 pool_status = self.account_pool.status()
                 raise Exception(
@@ -591,12 +595,22 @@ class QwenClient:
                     self.account_pool.mark_invalid(acc, reason="auth_error", error_message=str(e))
                     asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
                     exclude.add(acc.email)
-                elif _is_banned_error(err_msg):
-                    exclude.add(acc.email)
                 elif "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg:
                     pass  # already handled above, mark_rate_limited excludes implicitly
-                # 泛化错误不排除账号，允许用同一账号重试
-                self.account_pool.release(acc)
                 log.warning(f"[T2I Retry {attempt+1}/{settings.MAX_RETRIES}] Account {acc.email} failed: {e}")
+                
+                # 如果是外部传入的账号且失败了，直接抛出异常，不再内部死循环重试
+                if pre_acquired_acc:
+                    raise
+            except BaseException as e:
+                # Catch CancelledError and other non-Exception BaseExceptions
+                if chat_id:
+                    self.active_chat_ids.discard(chat_id)
+                log.warning(f"[T2I Retry {attempt+1}/{settings.MAX_RETRIES}] Account {acc.email} aborted due to BaseException: {type(e).__name__}")
+                raise
+            finally:
+                # Ensure the account is released if we acquired it here
+                if not pre_acquired_acc and acc:
+                    self.account_pool.release(acc)
 
         raise Exception(f"All {settings.MAX_RETRIES} T2I attempts failed.")

@@ -143,7 +143,7 @@ async def create_image(request: Request):
 async def edit_image(
     request: Request,
     image: UploadFile = File(...),
-    mask: UploadFile = File(None),
+    mask: UploadFile | None = File(None),
     prompt: str = Form(...),
     n: int = Form(1),
     size: str = Form("1024x1024"),
@@ -182,15 +182,16 @@ async def edit_image(
         
         # TODO: 暂时忽略 mask 遮罩文件，千问可能不需要分离的遮罩，或者需要另外拼图。这里只上传主图。
         
-        # 3. 携带上传文件发起图生图生成
+        # 3. 携带上传文件和刚才的账号，发起图生图生成，避免死锁
         answer_text, used_acc, chat_id = await client.image_generate_with_retry(
             model_resolved, 
             prompt,
-            uploaded_files=[uploaded_file_info]
+            uploaded_files=[uploaded_file_info],
+            pre_acquired_acc=acc
         )
 
         # 后台清理会话
-        client.account_pool.release(used_acc)
+        # 注意：此处不主动 release used_acc，因为在 finally 块中统一处理了 release(acc)
         asyncio.create_task(client.delete_chat(used_acc.token, chat_id))
 
         # 提取图片 URL
