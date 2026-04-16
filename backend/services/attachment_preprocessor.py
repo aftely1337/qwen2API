@@ -84,7 +84,7 @@ async def preprocess_attachments(payload: dict[str, Any], file_store, owner_toke
                         content_type, raw = _decode_data_uri(url_str)
                     elif url_str.startswith("http"):
                         import httpx
-                        async with httpx.AsyncClient(timeout=10) as hc:
+                        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as hc:
                             resp = await hc.get(url_str)
                             resp.raise_for_status()
                             raw = resp.content
