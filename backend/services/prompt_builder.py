@@ -51,6 +51,22 @@ def _extract_text(content, user_tool_mode: bool = False) -> str:
         return "\n".join(p for p in parts if p)
     return ""
 
+def extract_image_urls_from_messages(messages: list) -> list[str]:
+    """Extract base64 image strings or URLs from OpenAI format messages array."""
+    images = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    img_url_obj = part.get("image_url", {})
+                    if isinstance(img_url_obj, dict):
+                        url = img_url_obj.get("url", "")
+                        if url:
+                            images.append(url)
+                    elif isinstance(img_url_obj, str):
+                        images.append(img_url_obj)
+    return images
 
 def _normalize_tool(tool: dict) -> dict:
     """Normalize OpenAI or Anthropic tool format to internal {name, description, parameters}."""

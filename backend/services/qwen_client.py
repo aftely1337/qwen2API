@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Optional, Any
@@ -66,6 +67,7 @@ class QwenClient:
             if (r["status"] in (401, 403)
                     or "unauthorized" in body_lower or "forbidden" in body_lower
                     or "token" in body_lower or "login" in body_lower
+                    or "expired" in body_lower
                     or "401" in body_text or "403" in body_text):
                 raise Exception(f"unauthorized: create_chat HTTP {r['status']}: {body_text[:100]}")
             raise Exception(f"create_chat HTTP {r['status']}: {body_text[:100]}")
@@ -175,6 +177,86 @@ class QwenClient:
         except Exception:
             return []
 
+    async def upload_file(self, token: str, file_content: bytes, filename: str, content_type: str = "image/png") -> dict:
+        from curl_cffi.curl import CurlMime
+        from curl_cffi.requests import AsyncSession
+        from backend.services.auth_resolver import BASE_URL
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Referer": "https://chat.qwen.ai/",
+            "Origin": "https://chat.qwen.ai",
+            "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+        }
+
+        try:
+            multipart = CurlMime()
+            multipart.addpart(name="file", filename=filename, content_type=content_type, data=file_content)
+
+            async with AsyncSession(impersonate="chrome124", timeout=120) as client:
+                resp = await client.post(f"{BASE_URL}/api/v1/files/", headers=headers, multipart=multipart)
+            if resp.status_code != 200:
+                log.warning(f"[upload_file] HTTP {resp.status_code}: {resp.text[:100]}")
+                body_text = resp.text
+                if resp.status_code in (401, 403) or "unauthorized" in body_text.lower() or "expired" in body_text.lower():
+                    raise Exception(f"unauthorized: Upload failed: HTTP {resp.status_code}")
+                raise Exception(f"Upload failed: HTTP {resp.status_code}")
+
+            data = resp.json()
+            file_id = data.get("id")
+            if not file_id:
+                raise Exception(f"Upload failed: Missing file 'id' in response. {data}")
+
+            async with AsyncSession(impersonate="chrome124", timeout=30) as client:
+                meta_resp = await client.get(f"{BASE_URL}/api/v1/files/{file_id}", headers=headers)
+            if meta_resp.status_code != 200:
+                log.warning(f"[upload_file] meta HTTP {meta_resp.status_code}: {meta_resp.text[:100]}")
+                raise Exception(f"Upload meta failed: HTTP {meta_resp.status_code}")
+            meta = meta_resp.json()
+
+            log.info(f"[upload_file] 成功上传文件: {filename}, file_id: {file_id}")
+
+            file_meta = meta.get("meta") or {}
+            uploaded = {
+                "type": "image",
+                "file": {
+                    "created_at": meta.get("created_at") or data.get("created_at"),
+                    "data": meta.get("data") or data.get("data") or {},
+                    "filename": meta.get("filename") or data.get("filename") or filename,
+                    "hash": meta.get("hash"),
+                    "id": file_id,
+                    "user_id": meta.get("user_id") or data.get("user_id"),
+                    "meta": file_meta,
+                    "update_at": meta.get("updated_at") or data.get("updated_at"),
+                },
+                "id": file_id,
+                "url": meta.get("path") or f"oss://qwen-webui-prod/{(meta.get('user_id') or data.get('user_id') or '').strip()}/{file_id}_{filename}",
+                "name": file_meta.get("name") or filename,
+                "collection_name": "",
+                "progress": 100,
+                "status": "uploaded",
+                "greenNet": "success",
+                "size": file_meta.get("size") or len(file_content),
+                "error": "",
+                "itemId": str(uuid.uuid4()),
+                "file_type": file_meta.get("content_type") or content_type,
+                "showType": "image",
+                "file_class": "vision",
+                "uploadTaskId": str(uuid.uuid4()),
+            }
+            return uploaded
+        except Exception as e:
+            log.error(f"[upload_file] 文件上传出错: {e}")
+            raise
+
     def _build_payload(self, chat_id: str, model: str, content: str, has_custom_tools: bool = False) -> dict:
         ts = int(time.time())
         # 有工具时关闭思考模式——工具调用只需要输出结构化 JSON，思考会白白浪费几十秒
@@ -203,19 +285,108 @@ class QwenClient:
             "timestamp": ts,
         }
 
-    def _build_image_payload(self, chat_id: str, model: str, prompt: str) -> dict:
+    def _build_payload_with_files(self, chat_id: str, model: str, content: str, files: list[dict]) -> dict:
+        ts = int(time.time())
+        feature_config = {
+            "thinking_enabled": True,
+            "output_schema": "phase",
+            "research_mode": "normal",
+            "auto_thinking": True,
+            "thinking_mode": "Auto",
+            "thinking_format": "summary",
+            "auto_search": True,
+            "code_interpreter": False,
+            "function_calling": False,
+            "plugins_enabled": True,
+        }
+        return {
+            "stream": True,
+            "version": "2.1",
+            "incremental_output": True,
+            "chat_id": chat_id,
+            "chat_mode": "normal",
+            "model": model,
+            "parent_id": None,
+            "messages": [{
+                "fid": str(uuid.uuid4()),
+                "parentId": None,
+                "childrenIds": [str(uuid.uuid4())],
+                "role": "user",
+                "content": content,
+                "user_action": "chat",
+                "files": files or [],
+                "timestamp": ts,
+                "models": [model],
+                "chat_type": "t2t",
+                "feature_config": feature_config,
+                "extra": {"meta": {"subChatType": "t2t"}},
+                "sub_chat_type": "t2t",
+                "parent_id": None,
+            }],
+            "timestamp": ts,
+        }
+
+    def _build_image_payload(self, chat_id: str, model: str, prompt: str, uploaded_files: list[dict] = None) -> dict:
         ts = int(time.time())
         feature_config = {
             "thinking_enabled": False,
             "output_schema": "phase",
+            "research_mode": "normal",
             "auto_thinking": False,
             "thinking_mode": "off",
+            "thinking_format": "summary",
             "auto_search": False,
             "code_interpreter": False,
             "function_calling": False,
             "plugins_enabled": True,
             "image_generation": True,
             "default_aspect_ratio": "16:9",
+        }
+        files_array = []
+        if uploaded_files:
+            files_array.extend(uploaded_files)
+        
+        return {
+            "stream": True,
+            "version": "2.1",
+            "incremental_output": True,
+            "chat_id": chat_id,
+            "chat_mode": "normal",
+            "model": model,
+            "parent_id": None,
+            "messages": [{
+                "fid": str(uuid.uuid4()),
+                "parentId": None,
+                "childrenIds": [str(uuid.uuid4())],
+                "role": "user",
+                "content": prompt,
+                "user_action": "chat",
+                "files": files_array,
+                "timestamp": ts,
+                "models": [model],
+                "chat_type": "t2t",
+                "feature_config": feature_config,
+                "extra": {"meta": {"subChatType": "t2t", "mode": "image_generation", "aspectRatio": "16:9"}},
+                "sub_chat_type": "t2t",
+                "parent_id": None,
+            }],
+            "timestamp": ts,
+        }
+
+    def _build_image_edit_payload(self, chat_id: str, model: str, prompt: str, uploaded_files: list[dict]) -> dict:
+        ts = int(time.time())
+        feature_config = {
+            "thinking_enabled": False,
+            "output_schema": "phase",
+            "research_mode": "normal",
+            "auto_thinking": False,
+            "thinking_mode": "off",
+            "thinking_format": "summary",
+            "auto_search": False,
+            "code_interpreter": False,
+            "function_calling": False,
+            "plugins_enabled": True,
+            "image_generation": True,
         }
         return {
             "stream": True,
@@ -232,13 +403,13 @@ class QwenClient:
                 "role": "user",
                 "content": prompt,
                 "user_action": "chat",
-                "files": [],
+                "files": uploaded_files or [],
                 "timestamp": ts,
                 "models": [model],
-                "chat_type": "t2t",
+                "chat_type": "image_edit",
                 "feature_config": feature_config,
-                "extra": {"meta": {"subChatType": "t2i", "mode": "image_generation", "aspectRatio": "16:9"}},
-                "sub_chat_type": "t2i",
+                "extra": {"meta": {"subChatType": "image_edit", "mode": "image_edit"}},
+                "sub_chat_type": "image_edit",
                 "parent_id": None,
             }],
             "timestamp": ts,
@@ -280,7 +451,7 @@ class QwenClient:
                 })
         return parsed
 
-    async def chat_stream_events_with_retry(self, model: str, content: str, has_custom_tools: bool = False, exclude_accounts: Optional[set[str]] = None):
+    async def chat_stream_events_with_retry(self, model: str, content: str, has_custom_tools: bool = False, exclude_accounts: Optional[set[str]] = None, image_urls_for_vision: list = None):
         """无感容灾重试逻辑：上游挂了自动换号"""
         exclude = set(exclude_accounts or set())
         for attempt in range(settings.MAX_RETRIES):
@@ -296,7 +467,14 @@ class QwenClient:
                 
             chat_id: Optional[str] = None
             try:
-                log.info(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 获取账号：account={acc.email} model={model} tools={has_custom_tools} exclude={sorted(exclude)}")
+                # ── 先在这里执行上传 ──
+                uploaded_files = None
+                if image_urls_for_vision:
+                    from backend.api.v1_chat import process_image_urls
+                    uploaded_files = await process_image_urls(image_urls_for_vision, self, acc.token)
+                    log.info(f"[Vision] 成功上传了 {len(uploaded_files)} 个图片文件。")
+
+                log.info(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 获取账号：account={acc.email} model={model} tools={has_custom_tools} exclude={list(exclude)}")
                 # 本地节流：同账号两次上游请求之间保持最小间隔，降低自动化痕迹
                 min_interval = max(0, settings.ACCOUNT_MIN_INTERVAL_MS) / 1000.0
                 now = time.time()
@@ -306,7 +484,10 @@ class QwenClient:
                     await asyncio.sleep(wait_s)
                 chat_id = await self.create_chat(acc.token, model)
                 self.active_chat_ids.add(chat_id)
-                payload = self._build_payload(chat_id, model, content, has_custom_tools)
+                if uploaded_files:
+                    payload = self._build_payload_with_files(chat_id, model, content, uploaded_files)
+                else:
+                    payload = self._build_payload(chat_id, model, content, has_custom_tools)
                 log.info(
                     f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 已创建会话：account={acc.email} chat_id={chat_id} "
                     f"engine={self.engine.__class__.__name__} function_calling={payload['messages'][0]['feature_config'].get('function_calling')} "
@@ -315,6 +496,9 @@ class QwenClient:
 
                 # First yield the chat_id and account to the consumer
                 yield {"type": "meta", "chat_id": chat_id, "acc": acc}
+                
+                # Make sure acc is released if we yield and the consumer breaks the loop
+                # The caller should release, but just in case, we do it in finally if we don't return normally
 
                 buffer = ""
                 # 始终用流式模式：可实时发现 NativeBlock 并早期中止，不用等 3 分钟
@@ -322,13 +506,13 @@ class QwenClient:
                     if chunk_result.get("status") == 429:
                         log.warning(f"[本地背压 {attempt+1}/{settings.MAX_RETRIES}] 引擎队列已满：account={acc.email} chat_id={chat_id}")
                         raise Exception("local_backpressure: engine queue full")
-                    if chunk_result.get("status") != 200 and chunk_result.get("status") != "streamed":
+                    if chunk_result.get("status") not in (200, "streamed"):
                         body_preview = (chunk_result.get("body", "")[:120]).replace("\n", "\\n")
                         log.warning(
                             f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 上游分片异常：account={acc.email} chat_id={chat_id} "
                             f"status={chunk_result.get('status')} body_preview={body_preview!r}"
                         )
-                        raise Exception(f"HTTP {chunk_result['status']}: {chunk_result.get('body', '')[:100]}")
+                        raise Exception(f"HTTP {chunk_result.get('status')}: {chunk_result.get('body', '')[:100]}")
 
                     if "chunk" in chunk_result:
                         buffer += chunk_result["chunk"]
@@ -346,6 +530,7 @@ class QwenClient:
                         yield {"type": "event", "event": evt}
                 log.info(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 流式完成：account={acc.email} chat_id={chat_id} buffered_chars={len(buffer)}")
                 self.active_chat_ids.discard(chat_id)
+                # 不在这里 release acc，而是让调用者 release
                 return
 
             except Exception as e:
@@ -355,37 +540,144 @@ class QwenClient:
                 should_save = False
                 if "local_backpressure" in err_msg or "engine queue full" in err_msg:
                     acc.last_error = str(e)
+                    exclude.add(acc.email)
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 本地背压：account={acc.email} error={e}")
                 elif "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg:
+                    # 对于 429 报错，我们不将 valid 置为 False，而是 mark_rate_limited，由于 mark_rate_limited 会增加 strike 和设置 until 时间
                     self.account_pool.mark_rate_limited(acc, error_message=str(e))
                     exclude.add(acc.email)
+                    should_save = True
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 标记为限流：account={acc.email} error={e}")
                 elif _is_pending_activation_error(err_msg):
                     self.account_pool.mark_invalid(acc, reason="pending_activation", error_message=str(e))
                     exclude.add(acc.email)
-                    acc.activation_pending = True
                     should_save = True
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 标记为待激活：account={acc.email} error={e}")
                     asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
                 elif _is_banned_error(err_msg):
                     self.account_pool.mark_invalid(acc, reason="banned", error_message=str(e))
                     exclude.add(acc.email)
+                    should_save = True
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 标记为封禁：account={acc.email} error={e}")
-                elif _is_auth_error(err_msg):
+                elif _is_auth_error(err_msg) or "unauthorized" in err_msg or "expired" in err_msg or "token" in err_msg or "login" in err_msg or "401" in err_msg or "403" in err_msg:
                     self.account_pool.mark_invalid(acc, reason="auth_error", error_message=str(e))
                     exclude.add(acc.email)
+                    should_save = True
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 标记为鉴权失败：account={acc.email} error={e}")
                     asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
                 else:
                     acc.last_error = str(e)
+                    exclude.add(acc.email)
+                    should_save = True
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 瞬态错误：account={acc.email} error={e}")
 
                 if should_save:
                     await self.account_pool.save()
+                    
+                if acc:
+                    self.account_pool.release(acc)
+                    
+                log.info(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 账号失败，准备重试：account={acc.email} error={e}")
 
-                self.account_pool.release(acc)
-                log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 账号失败，准备重试：account={acc.email} error={e}")
+            except BaseException as base_e:
+                if chat_id:
+                    self.active_chat_ids.discard(chat_id)
+                log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] Account {acc.email} aborted due to BaseException: {type(base_e).__name__}")
+                if acc:
+                    self.account_pool.release(acc)
+                raise
                 
+        raise Exception(f"All {settings.MAX_RETRIES} attempts failed. Please check upstream accounts.")
+
+    async def chat_with_retry(self, model: str, content: str, has_custom_tools: bool = False, exclude_accounts: Optional[set[str]] = None, image_urls_for_vision: list = None):
+        """一次性返回所有对话结果"""
+        events = []
+        chat_id_out = None
+        acc_out = None
+        async for item in self.chat_stream_events_with_retry(model, content, has_custom_tools, exclude_accounts, image_urls_for_vision):
+            if item["type"] == "meta":
+                chat_id_out = item["chat_id"]
+                acc_out = item["acc"]
+            elif item["type"] == "event":
+                events.append(item["event"])
+        
+        answer_text = ""
+        for evt in events:
+            if evt.get("type") == "delta":
+                answer_text += evt.get("content", "")
+        return answer_text, acc_out, chat_id_out
+
+    async def vision_chat_with_retry(self, model: str, prompt: str, uploaded_files: list[dict], pre_acquired_acc: Optional["Account"] = None) -> tuple[str, "Account", str]:
+        exclude: set[str] = set()
+        for attempt in range(settings.MAX_RETRIES):
+            if pre_acquired_acc:
+                acc = pre_acquired_acc
+            else:
+                acc = await self.account_pool.acquire_wait(timeout=60, exclude=exclude)
+
+            if not acc:
+                pool_status = self.account_pool.status()
+                raise Exception(
+                    f"No available accounts in pool "
+                    f"(valid={pool_status['valid']}, rate_limited={pool_status['rate_limited']})"
+                )
+
+            chat_id: Optional[str] = None
+            try:
+                chat_id = await self.create_chat(acc.token, model, chat_type="t2t")
+                self.active_chat_ids.add(chat_id)
+                payload = self._build_payload_with_files(chat_id, model, prompt, uploaded_files or [])
+
+                buffer = ""
+                answer_text = ""
+                async for chunk_result in self.engine.fetch_chat(acc.token, chat_id, payload):
+                    if chunk_result.get("status") == 429:
+                        raise Exception("Engine Queue Full")
+                    if chunk_result.get("status") not in (200, "streamed"):
+                        raise Exception(f"HTTP {chunk_result.get('status')}: {chunk_result.get('body', '')[:200]}")
+
+                    raw = ""
+                    if "chunk" in chunk_result:
+                        raw = chunk_result["chunk"]
+                    elif "body" in chunk_result:
+                        raw = chunk_result.get("body", "") or ""
+                    if not raw:
+                        continue
+                    buffer += raw
+
+                for msg in buffer.split("\n\n"):
+                    for evt in self.parse_sse_chunk(msg):
+                        if evt.get("type") == "delta":
+                            answer_text += evt.get("content", "")
+
+                if not answer_text:
+                    answer_text = buffer
+
+                self.active_chat_ids.discard(chat_id)
+                return answer_text, acc, chat_id
+            except Exception as e:
+                if chat_id:
+                    self.active_chat_ids.discard(chat_id)  # type: ignore[arg-type]
+                if pre_acquired_acc:
+                    raise
+                err_msg = str(e).lower()
+                if "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg:
+                    self.account_pool.mark_rate_limited(acc, error_message=str(e))
+                elif _is_pending_activation_error(err_msg):
+                    self.account_pool.mark_invalid(acc, reason="pending_activation", error_message=str(e))
+                    asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
+                elif _is_banned_error(err_msg):
+                    self.account_pool.mark_invalid(acc, reason="banned", error_message=str(e))
+                elif _is_auth_error(err_msg):
+                    self.account_pool.mark_invalid(acc, reason="auth_error", error_message=str(e))
+                    asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
+                    exclude.add(acc.email)
+                self.account_pool.release(acc)
+                continue
+            finally:
+                if chat_id and pre_acquired_acc:
+                    pass
+
         raise Exception(f"All {settings.MAX_RETRIES} attempts failed. Please check upstream accounts.")
 
     def _extract_urls_from_extra(self, extra: dict) -> list[str]:
@@ -432,11 +724,23 @@ class QwenClient:
                                 urls.append(sub_val)
         return urls
 
-    async def image_generate_with_retry(self, model: str, prompt: str, exclude_accounts: Optional[set[str]] = None) -> tuple[str, "Account", str]:
+    def _redact_url_query(self, url: str) -> str:
+        if "?" in url:
+            return url.split("?", 1)[0] + "?<redacted>"
+        return url
+
+    def _redact_urls_in_text(self, text: str) -> str:
+        return re.sub(r"(https?://[^\\s)\\]\"'>]+)\\?[^\\s)\\]\"'>]+", r"\\1?<redacted>", text)
+
+    async def image_generate_with_retry(self, model: str, prompt: str, exclude_accounts: Optional[set[str]] = None, uploaded_files: list[dict] = None, pre_acquired_acc: Optional["Account"] = None) -> tuple[str, "Account", str]:
         """调用千问 T2I 生成图片，返回 (原始响应文本, 使用的账号, chat_id)"""
         exclude = set(exclude_accounts or set())
         for attempt in range(settings.MAX_RETRIES):
-            acc = await self.account_pool.acquire_wait(timeout=60, exclude=exclude)
+            if pre_acquired_acc:
+                acc = pre_acquired_acc
+            else:
+                acc = await self.account_pool.acquire_wait(timeout=60, exclude=exclude)
+                
             if not acc:
                 pool_status = self.account_pool.status()
                 raise Exception(
@@ -446,9 +750,13 @@ class QwenClient:
 
             chat_id: Optional[str] = None
             try:
-                chat_id = await self.create_chat(acc.token, model, chat_type="t2i")
+                chat_id = await self.create_chat(acc.token, model, chat_type="image_edit" if uploaded_files else "t2t")
                 self.active_chat_ids.add(chat_id)
-                payload = self._build_image_payload(chat_id, model, prompt)
+                payload = (
+                    self._build_image_edit_payload(chat_id, model, prompt, uploaded_files or [])
+                    if uploaded_files
+                    else self._build_image_payload(chat_id, model, prompt, uploaded_files=None)
+                )
 
                 raw_body_parts: list[str] = []  # 保存原始 SSE body 用于 debug
                 answer_text = ""
@@ -459,7 +767,7 @@ class QwenClient:
                     if chunk_result.get("status") == 429:
                         raise Exception("Engine Queue Full")
                     if chunk_result.get("status") not in (200, "streamed"):
-                        raise Exception(f"HTTP {chunk_result['status']}: {chunk_result.get('body', '')[:200]}")
+                        raise Exception(f"HTTP {chunk_result.get('status')}: {chunk_result.get('body', '')[:200]}")
 
                     # 把原始文本拼进 buffer
                     raw = ""
@@ -475,7 +783,7 @@ class QwenClient:
 
                 # 处理整个 buffer（不论流式还是一次性返回）
                 raw_body = "".join(raw_body_parts)
-                log.info(f"[T2I] 原始 SSE body 前 1000 字符: {raw_body[:1000]!r}")
+                log.info(f"[T2I] 原始 SSE body 前 1000 字符: {self._redact_urls_in_text(raw_body[:1000])!r}")
 
                 for line in raw_body.splitlines():
                     line = line.strip()
@@ -490,7 +798,7 @@ class QwenClient:
                         continue
 
                     # 打印每个 SSE 事件用于诊断
-                    log.info(f"[T2I-SSE] 事件: {json.dumps(obj, ensure_ascii=False)[:400]}")
+                    log.info(f"[T2I-SSE] 事件: {self._redact_urls_in_text(json.dumps(obj, ensure_ascii=False)[:400])}")
 
                     # 从 choices[0].delta 提取
                     if obj.get("choices"):
@@ -514,7 +822,7 @@ class QwenClient:
 
                 # 如果 extra 里找到了图片 URL，把它们拼成 Markdown 图片格式追加进 answer_text
                 if extra_urls:
-                    log.info(f"[T2I] 从 extra 字段提取到 {len(extra_urls)} 个图片 URL: {extra_urls}")
+                    log.info(f"[T2I] 从 extra 字段提取到 {len(extra_urls)} 个图片 URL: {[self._redact_url_query(u) for u in extra_urls]}")
                     for url in extra_urls:
                         answer_text += f"\n![image]({url})"
 
@@ -522,15 +830,19 @@ class QwenClient:
                 if not answer_text:
                     answer_text = raw_body
 
+                lower_text = answer_text.lower()
+                if "allocated quota exceeded" in lower_text or "quota exceeded" in lower_text or "token-limit" in lower_text:
+                    raise Exception("Image Generation Quota Exceeded")
+
                 self.active_chat_ids.discard(chat_id)
-                log.info(f"[T2I] 生成完成，响应长度={len(answer_text)}: {answer_text[:200]!r}")
+                log.info(f"[T2I] 生成完成，响应长度={len(answer_text)}: {self._redact_urls_in_text(answer_text[:200])!r}")
                 return answer_text, acc, chat_id
 
             except Exception as e:
                 if chat_id:
                     self.active_chat_ids.discard(chat_id)  # type: ignore[arg-type]
                 err_msg = str(e).lower()
-                if "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg:
+                if "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg or "quota exceeded" in err_msg or "token-limit" in err_msg:
                     self.account_pool.mark_rate_limited(acc, error_message=str(e))
                 elif _is_pending_activation_error(err_msg):
                     self.account_pool.mark_invalid(acc, reason="pending_activation", error_message=str(e))
@@ -541,12 +853,20 @@ class QwenClient:
                     self.account_pool.mark_invalid(acc, reason="auth_error", error_message=str(e))
                     asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
                     exclude.add(acc.email)
-                elif _is_banned_error(err_msg):
-                    exclude.add(acc.email)
-                elif "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg:
-                    pass  # already handled above, mark_rate_limited excludes implicitly
-                # 泛化错误不排除账号，允许用同一账号重试
-                self.account_pool.release(acc)
                 log.warning(f"[T2I Retry {attempt+1}/{settings.MAX_RETRIES}] Account {acc.email} failed: {e}")
+                
+                # 如果是外部传入的账号且失败了，直接抛出异常，不再内部死循环重试
+                if pre_acquired_acc:
+                    raise
+            except BaseException as e:
+                # Catch CancelledError and other non-Exception BaseExceptions
+                if chat_id:
+                    self.active_chat_ids.discard(chat_id)
+                log.warning(f"[T2I Retry {attempt+1}/{settings.MAX_RETRIES}] Account {acc.email} aborted due to BaseException: {type(e).__name__}")
+                raise
+            finally:
+                # Ensure the account is released if we acquired it here
+                if not pre_acquired_acc and acc:
+                    self.account_pool.release(acc)
 
         raise Exception(f"All {settings.MAX_RETRIES} T2I attempts failed.")

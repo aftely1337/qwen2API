@@ -33,11 +33,13 @@ class Account:
         self.token = token
         self.cookies = cookies
         self.username = username
-        self.activation_pending = activation_pending
-        self.valid = not activation_pending
+        self.activation_pending = kwargs.get("activation_pending", activation_pending)
+        self.valid = kwargs.get("is_valid", kwargs.get("valid", not self.activation_pending))
+        if isinstance(self.valid, str):
+            self.valid = self.valid.lower() == 'true'
         self.last_used = 0.0
         self.inflight = 0
-        self.rate_limited_until = 0.0
+        self.rate_limited_until = float(kwargs.get("rate_limited_until", 0.0) or 0.0)
         self.healing = False
         self.status_code = status_code or ("pending_activation" if activation_pending else "valid")
         self.last_error = last_error or ""
@@ -50,7 +52,14 @@ class Account:
         return self.rate_limited_until > time.time()
 
     def is_available(self) -> bool:
-        return self.valid and not self.is_rate_limited()
+        if self.activation_pending:
+            return False
+        if self.status_code in ("banned", "auth_error", "invalid"):
+            return False
+        # Treat rate limited as available for now (so acquire_wait can wait on it)
+        if not self.valid and self.status_code not in ("valid", "rate_limited"):
+            return False
+        return True
 
     def next_available_at(self) -> float:
         min_interval = max(0, settings.ACCOUNT_MIN_INTERVAL_MS) / 1000.0
@@ -61,12 +70,12 @@ class Account:
             return "pending_activation"
         if self.is_rate_limited():
             return "rate_limited"
-        if self.valid:
-            return "valid"
         if self.status_code == "banned":
             return "banned"
         if self.status_code == "auth_error":
             return "auth_error"
+        if self.valid:
+            return "valid"
         return self.status_code or "invalid"
 
     def get_status_text(self) -> str:
@@ -95,6 +104,8 @@ class Account:
             "last_request_finished": self.last_request_finished,
             "consecutive_failures": self.consecutive_failures,
             "rate_limit_strikes": self.rate_limit_strikes,
+            "valid": self.valid,
+            "rate_limited_until": self.rate_limited_until
         }
 
 
@@ -109,7 +120,8 @@ class AccountPool:
 
     async def load(self):
         data = await self.db.load()
-        self.accounts = [Account(**d) for d in data] if isinstance(data, list) else []
+        async with self._lock:
+            self.accounts = [Account(**d) for d in data] if isinstance(data, list) else []
         log.info(f"Loaded {len(self.accounts)} upstream account(s)")
 
     async def save(self):
@@ -133,10 +145,13 @@ class AccountPool:
         async with self._lock:
             now = time.time()
             available = [a for a in self.accounts if a.is_available() and (not exclude or a.email not in exclude)]
+            log.info(f"Checking {len(self.accounts)} accounts, available: {len(available)}, valid: {[a.valid for a in self.accounts]}, rate_limited: {[a.is_rate_limited() for a in self.accounts]}, activation: {[a.activation_pending for a in self.accounts]}, exclude: {exclude}")
             if not available:
+                log.info(f"No available accounts out of {len(self.accounts)}. Status: {[a.get_status_code() for a in self.accounts]}")
                 return None
 
             ready = [a for a in available if a.inflight < self.max_inflight and a.next_available_at() <= now]
+            log.info(f"Accounts ready: {len(ready)}, max_inflight: {self.max_inflight}, inflight: {[a.inflight for a in available]}, next_available_at: {[a.next_available_at() for a in available]}, now: {now}")
             if not ready:
                 return None
 
@@ -158,7 +173,7 @@ class AccountPool:
             async with self._lock:
                 candidates = [
                     a for a in self.accounts
-                    if a.valid and (not exclude or a.email not in exclude)
+                    if a.is_available() and (not exclude or a.email not in exclude)
                 ]
                 if not candidates:
                     return None
@@ -188,7 +203,7 @@ class AccountPool:
 
     def mark_invalid(self, acc: Account, reason: str = "invalid", error_message: str = ""):
         acc.valid = False
-        acc.status_code = reason or "invalid"
+        acc.status_code = reason
         acc.last_error = error_message or acc.last_error
         acc.consecutive_failures += 1
         if reason == "pending_activation":
@@ -205,17 +220,12 @@ class AccountPool:
         if not acc.activation_pending:
             acc.valid = True
 
-    def mark_rate_limited(self, acc: Account, cooldown: int | None = None, error_message: str = ""):
-        acc.rate_limit_strikes += 1
-        base = cooldown if cooldown is not None else settings.RATE_LIMIT_BASE_COOLDOWN
-        dynamic = min(settings.RATE_LIMIT_MAX_COOLDOWN, int(base * (2 ** max(0, acc.rate_limit_strikes - 1))))
-        dynamic += int(_jitter_seconds())
-        acc.rate_limited_until = time.time() + dynamic
-        acc.status_code = "rate_limited"
-        acc.last_error = error_message or acc.last_error
-        if self._sticky_email == acc.email:
-            self._sticky_email = None
-        log.warning(f"[账号] {acc.email} 已限流冷却 {dynamic} 秒")
+    def mark_rate_limited(self, account: Account, error_message: str = ""):
+        account.rate_limit_strikes += 1
+        wait_seconds = min(60 * (2 ** (account.rate_limit_strikes - 1)), settings.ACCOUNT_MAX_RATE_LIMIT_COOLDOWN_MS / 1000.0)
+        account.rate_limited_until = time.time() + wait_seconds
+        account.last_error = error_message or "Rate limited"
+        log.warning(f"Account {account.email} rate limited for {wait_seconds}s (strike {account.rate_limit_strikes})")
 
     def status(self):
         available = [a for a in self.accounts if a.is_available()]
@@ -223,6 +233,7 @@ class AccountPool:
         invalid = [a for a in self.accounts if a.get_status_code() not in ("valid", "rate_limited")]
         activation_pending = [a for a in self.accounts if a.get_status_code() == "pending_activation"]
         banned = [a for a in self.accounts if a.get_status_code() == "banned"]
+        auth_error = [a for a in self.accounts if a.get_status_code() == "auth_error"]
         in_use = sum(a.inflight for a in self.accounts)
         return {
             "total": len(self.accounts),
@@ -231,6 +242,7 @@ class AccountPool:
             "invalid": len(invalid),
             "activation_pending": len(activation_pending),
             "banned": len(banned),
+            "auth_error": len(auth_error),
             "in_use": in_use,
             "max_inflight": self.max_inflight,
             "waiting": len(self._waiters),
