@@ -90,9 +90,12 @@ _CAMOUFOX_OPTS = {
     "os": "windows",                # 明确 Windows 指纹，与服务器一致
     "locale": "zh-CN",              # 中文用户语言
     "firefox_user_prefs": {
-        # 用软件 WebRender 替代完全禁用，真实机器通常开启 WebRender
-        "gfx.webrender.software": True,
         "media.hardware-video-decoding.enabled": False,  # 服务器无 GPU，仅关闭硬件视频解码
+        "gfx.webrender.all": True,
+        "gfx.webrender.software": True, # Force software WebRender
+        # Disable sandbox to avoid issues in container
+        "security.sandbox.content.level": 0,
+        "security.sandbox.content.syscall_whitelist": "",
         # 启用缓存，更像真实用户
         "browser.cache.disk.enable": True,
         "browser.cache.memory.enable": True,
@@ -101,6 +104,11 @@ _CAMOUFOX_OPTS = {
         "browser.shell.checkDefaultBrowser": False,
     },
 }
+
+import os
+if os.environ.get("DOCKER_CONTAINER"):
+    # If inside docker, ensure camoufox runs without sandbox or xvfb issues if possible
+    os.environ["MOZ_DISABLE_CONTENT_SANDBOX"] = "1"
 
 @asynccontextmanager
 async def _new_browser():
@@ -198,7 +206,8 @@ class BrowserEngine:
 
     async def api_call(self, method: str, path: str, token: str, body: dict = None) -> dict:
         await asyncio.wait_for(self._ready.wait(), timeout=300)
-        if not self._started:
+        if not getattr(self, "_started", False):
+            log.warning("api_call failed because browser engine is not started.")
             return {"status": 0, "body": "Browser engine failed to start"}
         try:
             page = await asyncio.wait_for(self._pages.get(), timeout=60)
@@ -228,6 +237,7 @@ class BrowserEngine:
         """Camoufox Firefox 完整收取 SSE 响应后一次性返回，绕开 expose_function 跨语言回调限制。"""
         await asyncio.wait_for(self._ready.wait(), timeout=300)
         if not self._started:
+            log.warning("fetch_chat failed because browser engine is not started.")
             yield {"status": 0, "body": "Browser engine failed to start"}
             return
 

@@ -67,6 +67,7 @@ class QwenClient:
             if (r["status"] in (401, 403)
                     or "unauthorized" in body_lower or "forbidden" in body_lower
                     or "token" in body_lower or "login" in body_lower
+                    or "expired" in body_lower
                     or "401" in body_text or "403" in body_text):
                 raise Exception(f"unauthorized: create_chat HTTP {r['status']}: {body_text[:100]}")
             raise Exception(f"create_chat HTTP {r['status']}: {body_text[:100]}")
@@ -204,6 +205,9 @@ class QwenClient:
                 resp = await client.post(f"{BASE_URL}/api/v1/files/", headers=headers, multipart=multipart)
             if resp.status_code != 200:
                 log.warning(f"[upload_file] HTTP {resp.status_code}: {resp.text[:100]}")
+                body_text = resp.text
+                if resp.status_code in (401, 403) or "unauthorized" in body_text.lower() or "expired" in body_text.lower():
+                    raise Exception(f"unauthorized: Upload failed: HTTP {resp.status_code}")
                 raise Exception(f"Upload failed: HTTP {resp.status_code}")
 
             data = resp.json()
@@ -539,13 +543,14 @@ class QwenClient:
                     exclude.add(acc.email)
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 本地背压：account={acc.email} error={e}")
                 elif "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg:
+                    # 对于 429 报错，我们不将 valid 置为 False，而是 mark_rate_limited，由于 mark_rate_limited 会增加 strike 和设置 until 时间
                     self.account_pool.mark_rate_limited(acc, error_message=str(e))
                     exclude.add(acc.email)
+                    should_save = True
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 标记为限流：account={acc.email} error={e}")
                 elif _is_pending_activation_error(err_msg):
                     self.account_pool.mark_invalid(acc, reason="pending_activation", error_message=str(e))
                     exclude.add(acc.email)
-                    acc.activation_pending = True
                     should_save = True
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 标记为待激活：account={acc.email} error={e}")
                     asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
@@ -554,15 +559,16 @@ class QwenClient:
                     exclude.add(acc.email)
                     should_save = True
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 标记为封禁：account={acc.email} error={e}")
-                elif _is_auth_error(err_msg):
+                elif _is_auth_error(err_msg) or "unauthorized" in err_msg or "expired" in err_msg or "token" in err_msg or "login" in err_msg:
                     self.account_pool.mark_invalid(acc, reason="auth_error", error_message=str(e))
                     exclude.add(acc.email)
                     should_save = True
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 标记为鉴权失败：account={acc.email} error={e}")
-                    asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
+                    # asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
                 else:
                     acc.last_error = str(e)
                     exclude.add(acc.email)
+                    should_save = True
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 瞬态错误：account={acc.email} error={e}")
 
                 if should_save:

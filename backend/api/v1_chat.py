@@ -322,7 +322,7 @@ async def chat_completions(request: Request):
                         if acc is not None:
                             excluded_accounts.add(acc.email)
                             client.account_pool.release(acc)
-                        log.warning(f"[Stream] 空响应，重试 (attempt {stream_attempt+1}/{settings.MAX_RETRIES})")
+                        log.warning(f"[Stream] 空响应，重试 (attempt {stream_attempt+1}/{max_attempts})")
                         await aio.sleep(0.3)
                         continue
 
@@ -443,7 +443,7 @@ async def chat_completions(request: Request):
                             current_prompt = current_prompt[:-len("Assistant:")] + force_text + "\nAssistant:"
                         else:
                             current_prompt += "\n\n" + force_text + "\nAssistant:"
-                        log.warning(f"[ToolLoop-OAI] 检测到 Unchanged since last read，立即阻止重复 Read (attempt {stream_attempt+1}/{settings.MAX_RETRIES})")
+                        log.warning(f"[ToolLoop-OAI] 检测到 Unchanged since last read，立即阻止重复 Read (attempt {stream_attempt+1}/{max_attempts})")
                         await aio.sleep(0.15)
                         continue
 
@@ -532,7 +532,7 @@ async def chat_completions(request: Request):
                         events.append(item["event"])
 
                 if not has_event and stream_attempt < max_attempts - 1:
-                    log.warning(f"[NonStream] 空响应，重试 (attempt {stream_attempt+1}/{settings.MAX_RETRIES})")
+                    log.warning(f"[NonStream] 空响应，重试 (attempt {stream_attempt+1}/{max_attempts})")
                     if acc is not None:
                         excluded_accounts.add(acc.email)
                         client.account_pool.release(acc)
@@ -571,7 +571,7 @@ async def chat_completions(request: Request):
                         
                 if not answer_text and not reasoning_text and not native_tc_chunks:
                     if stream_attempt < max_attempts - 1:
-                        log.warning(f"[NonStream] 响应文本为空，重试 (attempt {stream_attempt+1}/{settings.MAX_RETRIES})")
+                        log.warning(f"[NonStream] 响应文本为空，重试 (attempt {stream_attempt+1}/{max_attempts})")
                         if acc is not None:
                             excluded_accounts.add(acc.email)
                             client.account_pool.release(acc)
@@ -608,9 +608,8 @@ async def chat_completions(request: Request):
                         blocked_tool_call, blocked_reason = should_block_tool_call(history_messages, first_tool.get("name", ""), first_tool.get("input", {}))
                         if blocked_tool_call and stream_attempt < max_attempts - 1:
                             if acc:
+                                excluded_accounts.add(acc.email)
                                 client.account_pool.release(acc)
-                                if chat_id:
-                                    aio.create_task(client.delete_chat(acc.token, chat_id))
                             current_prompt = current_prompt.rstrip()
                             force_text = (
                                 f"[MANDATORY NEXT STEP]: {blocked_reason}. "
@@ -628,9 +627,8 @@ async def chat_completions(request: Request):
                             and _has_recent_unchanged_read_result(history_messages)
                             and stream_attempt < max_attempts - 1):
                         if acc:
+                            excluded_accounts.add(acc.email)
                             client.account_pool.release(acc)
-                            if chat_id:
-                                aio.create_task(client.delete_chat(acc.token, chat_id))
                         current_prompt = current_prompt.rstrip()
                         force_text = (
                             "[MANDATORY NEXT STEP]: You just received 'Unchanged since last read'. "
@@ -684,6 +682,6 @@ async def chat_completions(request: Request):
                 if acc:
                     excluded_accounts.add(acc.email)
                     client.account_pool.release(acc)
-                if stream_attempt == settings.MAX_RETRIES - 1:
+                if stream_attempt == max_attempts - 1:
                     raise HTTPException(status_code=500, detail=str(e))
                 await aio.sleep(1)

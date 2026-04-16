@@ -42,11 +42,10 @@ class HybridEngine:
         body_text = (result.get("body") or "").lower()
         should_fallback = (
             status == 0
-            or status in (401, 403, 429)
+            or status in (429,)
             or "waf" in body_text
             or "<!doctype" in body_text
             or "forbidden" in body_text
-            or "unauthorized" in body_text
         )
         if should_fallback:
             preview = (result.get("body") or "")[:160].replace("\n", "\\n")
@@ -69,11 +68,10 @@ class HybridEngine:
                 # 浏览器返回错误，判断是否需要回退
                 body_text = (item.get("body") or "").lower()
                 is_hard_failure = (
-                    status in (401, 403, 429)
+                    status in (429,)
                     or "waf" in body_text
                     or "<!doctype" in body_text
                     or "forbidden" in body_text
-                    or "unauthorized" in body_text
                 )
                 if is_hard_failure and not saw_success:
                     browser_error = item
