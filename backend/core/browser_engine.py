@@ -95,7 +95,6 @@ _CAMOUFOX_OPTS = {
         "gfx.webrender.software": True, # Force software WebRender
         # Disable sandbox to avoid issues in container
         "security.sandbox.content.level": 0,
-        "security.sandbox.content.syscall_whitelist": "",
         # 启用缓存，更像真实用户
         "browser.cache.disk.enable": True,
         "browser.cache.memory.enable": True,
