@@ -503,7 +503,7 @@ class QwenClient:
 
             chat_id: Optional[str] = None
             try:
-                chat_id = await self.create_chat(acc.token, model, chat_type="t2i")
+                chat_id = await self.create_chat(acc.token, model, chat_type="t2t")
                 self.active_chat_ids.add(chat_id)
                 payload = self._build_image_payload(chat_id, model, prompt, uploaded_files=uploaded_files)
 
