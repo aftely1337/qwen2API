@@ -19,12 +19,12 @@ from backend.core.config import resolve_model, settings, IMAGE_MODEL_DEFAULT
 log = logging.getLogger("qwen2api.chat")
 router = APIRouter()
 
-async def _stream_items_with_keepalive(client, model: str, prompt: str, has_custom_tools: bool, exclude_accounts=None, uploaded_files: list = None):
+async def _stream_items_with_keepalive(client, model: str, prompt: str, has_custom_tools: bool, exclude_accounts=None, image_urls_for_vision: list = None):
     queue: aio.Queue = aio.Queue()
 
     async def _producer():
         try:
-            async for item in client.chat_stream_events_with_retry(model, prompt, has_custom_tools=has_custom_tools, exclude_accounts=exclude_accounts, uploaded_files=uploaded_files):
+            async for item in client.chat_stream_events_with_retry(model, prompt, has_custom_tools=has_custom_tools, exclude_accounts=exclude_accounts, image_urls_for_vision=image_urls_for_vision):
                 await queue.put(("item", item))
         except Exception as e:
             await queue.put(("error", e))
@@ -167,6 +167,7 @@ async def process_image_urls(image_urls: list[str], client: QwenClient, token: s
             uploaded_files.append(file_info)
         except Exception as e:
             log.error(f"[process_image_urls] Failed to process image {url[:50]}: {e}")
+            # 不阻断整体流程，失败就跳过当前图片
     return uploaded_files
 
 @router.post("/completions")
@@ -237,8 +238,6 @@ async def chat_completions(request: Request):
                 }, ensure_ascii=False)
                 try:
                     answer_text, acc, chat_id = await client.image_generate_with_retry(IMAGE_MODEL_DEFAULT, image_prompt)
-                    client.account_pool.release(acc)
-                    aio.create_task(client.delete_chat(acc.token, chat_id))
                     image_urls = _extract_image_urls(answer_text)
                     content = "\n".join(f"![generated]({u})" for u in image_urls) if image_urls else answer_text
                     yield f"data: {mk({'role': 'assistant'})}\n\n"
@@ -253,8 +252,6 @@ async def chat_completions(request: Request):
         else:
             try:
                 answer_text, acc, chat_id = await client.image_generate_with_retry(IMAGE_MODEL_DEFAULT, image_prompt)
-                client.account_pool.release(acc)
-                aio.create_task(client.delete_chat(acc.token, chat_id))
                 image_urls = _extract_image_urls(answer_text)
                 content = "\n".join(f"![generated]({u})" for u in image_urls) if image_urls else answer_text
                 from fastapi.responses import JSONResponse
@@ -283,26 +280,20 @@ async def chat_completions(request: Request):
                 # 上传图片以供多模态对话使用
                 nonlocal uploaded_files_for_vision
                 if image_urls_for_vision and not uploaded_files_for_vision:
-                    # 使用当前线程分配的可用账号上传图片
-                    upload_acc = await client.account_pool.acquire_wait(timeout=30)
-                    if not upload_acc:
-                        raise Exception("No account available for uploading images")
-                    try:
-                        uploaded_files_for_vision = await process_image_urls(image_urls_for_vision, client, upload_acc.token)
-                    finally:
-                        client.account_pool.release(upload_acc)
+                    # 不再预先 acquire 占用，而是作为 chat_stream_events_with_retry 里面的逻辑
+                    pass
 
                 # ── 无工具：事件到来立即转发给客户端（真流式）──────────────
                 if not tools:
                     sent_role = False
                     streamed_len = 0
-                    async for item in _stream_items_with_keepalive(client, qwen_model, current_prompt, has_custom_tools=False, exclude_accounts=excluded_accounts, uploaded_files=uploaded_files_for_vision):
+                    async for item in _stream_items_with_keepalive(client, qwen_model, current_prompt, has_custom_tools=False, exclude_accounts=excluded_accounts, image_urls_for_vision=image_urls_for_vision):
                         if item["type"] == "keepalive":
                             yield ": keepalive\n\n"
                             continue
                         if item["type"] == "meta":
-                            chat_id = item["chat_id"]
-                            meta_acc = item["acc"]
+                            chat_id = item.get("chat_id")
+                            meta_acc = item.get("acc")
                             if isinstance(meta_acc, Account):
                                 acc = meta_acc
                             yield ": upstream-connected\n\n"
@@ -329,10 +320,8 @@ async def chat_completions(request: Request):
                     # 空响应重试（还没发过内容才重试）
                     if streamed_len == 0 and stream_attempt < min(settings.EMPTY_RESPONSE_RETRIES, max_attempts - 1):
                         if acc is not None:
-                            client.account_pool.release(acc)
-                            if chat_id:
-                                aio.create_task(client.delete_chat(acc.token, chat_id))
                             excluded_accounts.add(acc.email)
+                            client.account_pool.release(acc)
                         log.warning(f"[Stream] 空响应，重试 (attempt {stream_attempt+1}/{settings.MAX_RETRIES})")
                         await aio.sleep(0.3)
                         continue
@@ -348,20 +337,18 @@ async def chat_completions(request: Request):
                             u["used_tokens"] += streamed_len + len(prompt)
                             break
                     await users_db.save(users)
-                    if acc is not None:
+                    if acc:
                         client.account_pool.release(acc)
-                        if chat_id:
-                            aio.create_task(client.delete_chat(acc.token, chat_id))
                     return
 
                 # ── 有工具：缓冲完整响应后解析工具调用（原逻辑）──────────────
-                async for item in _stream_items_with_keepalive(client, qwen_model, current_prompt, has_custom_tools=bool(tools), exclude_accounts=excluded_accounts, uploaded_files=uploaded_files_for_vision):
+                async for item in _stream_items_with_keepalive(client, qwen_model, current_prompt, has_custom_tools=bool(tools), exclude_accounts=excluded_accounts, image_urls_for_vision=image_urls_for_vision):
                     if item["type"] == "keepalive":
                         yield ": keepalive\n\n"
                         continue
                     if item["type"] == "meta":
-                        chat_id = item["chat_id"]
-                        meta_acc = item["acc"]
+                        chat_id = item.get("chat_id")
+                        meta_acc = item.get("acc")
                         if isinstance(meta_acc, Account):
                             acc = meta_acc
                         yield ": upstream-connected\n\n"
@@ -430,10 +417,6 @@ async def chat_completions(request: Request):
                     if first_tool:
                         blocked_tool_call, blocked_reason = should_block_tool_call(history_messages, first_tool.get("name", ""), first_tool.get("input", {}))
                         if blocked_tool_call and stream_attempt < max_attempts - 1:
-                            if acc:
-                                client.account_pool.release(acc)
-                                if chat_id:
-                                    aio.create_task(client.delete_chat(acc.token, chat_id))
                             current_prompt = current_prompt.rstrip()
                             force_text = (
                                 f"[MANDATORY NEXT STEP]: {blocked_reason}. "
@@ -450,10 +433,6 @@ async def chat_completions(request: Request):
                     if (first_tool and first_tool.get("name") == "Read"
                             and _has_recent_unchanged_read_result(history_messages)
                             and stream_attempt < max_attempts - 1):
-                        if acc:
-                            client.account_pool.release(acc)
-                            if chat_id:
-                                aio.create_task(client.delete_chat(acc.token, chat_id))
                         current_prompt = current_prompt.rstrip()
                         force_text = (
                             "[MANDATORY NEXT STEP]: You just received 'Unchanged since last read'. "
@@ -532,27 +511,36 @@ async def chat_completions(request: Request):
         chat_id: Optional[str] = None
         for stream_attempt in range(max_attempts):
             try:
+                # 上传图片以供多模态对话使用
+                if image_urls_for_vision and not uploaded_files_for_vision:
+                    pass
+
+                # 修改为收集事件的逻辑
                 events = []
                 chat_id = None
                 acc = None
                 
-                # 上传图片以供多模态对话使用
-                if image_urls_for_vision and not uploaded_files_for_vision:
-                    upload_acc = await client.account_pool.acquire_wait(timeout=30)
-                    if not upload_acc:
-                        raise RuntimeError("No account available for uploading images")
-                    try:
-                        uploaded_files_for_vision = await process_image_urls(image_urls_for_vision, client, upload_acc.token)
-                    finally:
-                        client.account_pool.release(upload_acc)
-
-                async for item in client.chat_stream_events_with_retry(qwen_model, current_prompt, has_custom_tools=bool(tools), exclude_accounts=excluded_accounts, uploaded_files=uploaded_files_for_vision):
+                # 若无任何事件则重试
+                has_event = False
+                async for item in client.chat_stream_events_with_retry(qwen_model, current_prompt, has_custom_tools=bool(tools), exclude_accounts=excluded_accounts, image_urls_for_vision=image_urls_for_vision):
                     if item["type"] == "meta":
-                        chat_id = item["chat_id"]
-                        acc = item["acc"]
+                        chat_id = item.get("chat_id")
+                        acc = item.get("acc")
                         continue
                     if item["type"] == "event":
+                        has_event = True
                         events.append(item["event"])
+
+                if not has_event and stream_attempt < max_attempts - 1:
+                    log.warning(f"[NonStream] 空响应，重试 (attempt {stream_attempt+1}/{settings.MAX_RETRIES})")
+                    if acc is not None:
+                        excluded_accounts.add(acc.email)
+                        client.account_pool.release(acc)
+                    await aio.sleep(0.3)
+                    continue
+
+                if not has_event:
+                    raise Exception("Empty upstream response")
 
                 answer_text = ""
                 reasoning_text = ""
@@ -581,6 +569,16 @@ async def chat_completions(request: Request):
                     if evt.get("status") == "finished" and phase == "answer":
                         break
                         
+                if not answer_text and not reasoning_text and not native_tc_chunks:
+                    if stream_attempt < max_attempts - 1:
+                        log.warning(f"[NonStream] 响应文本为空，重试 (attempt {stream_attempt+1}/{settings.MAX_RETRIES})")
+                        if acc is not None:
+                            excluded_accounts.add(acc.email)
+                            client.account_pool.release(acc)
+                        await aio.sleep(0.3)
+                        continue
+                    else:
+                        raise Exception("Empty upstream response content")
                 if native_tc_chunks and not answer_text:
                     tc_parts = []
                     for tc_id, tc in native_tc_chunks.items():
@@ -595,11 +593,10 @@ async def chat_completions(request: Request):
                 blocked_names = _extract_blocked_tool_names(answer_text.strip())
                 if blocked_names and tools and stream_attempt < max_attempts - 1:
                     blocked_name = blocked_names[0]
-                    if acc:
-                        client.account_pool.release(acc)
-                        if chat_id:
-                            aio.create_task(client.delete_chat(acc.token, chat_id))
                     current_prompt = inject_format_reminder(current_prompt, blocked_name)
+                    if acc is not None:
+                        excluded_accounts.add(acc.email)
+                        client.account_pool.release(acc)
                     await aio.sleep(0.15)
                     continue
 
@@ -672,25 +669,21 @@ async def chat_completions(request: Request):
                         break
                 await users_db.save(users)
 
-                if acc:
-                    client.account_pool.release(acc)
-                    if chat_id:
-                        import asyncio
-                        aio.create_task(client.delete_chat(acc.token, chat_id))
-
                 from fastapi.responses import JSONResponse
-                return JSONResponse({
+                resp = JSONResponse({
                     "id": completion_id, "object": "chat.completion", "created": created, "model": model_name,
                     "choices": [{"index": 0, "message": msg, "finish_reason": finish_reason}],
                     "usage": {"prompt_tokens": len(prompt), "completion_tokens": len(answer_text),
                               "total_tokens": len(prompt) + len(answer_text)}
                 })
-            except Exception as e:
-                if acc and acc.inflight > 0:
+                if acc:
                     client.account_pool.release(acc)
-                    if chat_id:
-                        import asyncio
-                        aio.create_task(client.delete_chat(acc.token, chat_id))
+                return resp
+            except Exception as e:
+                log.error(f"[OAI] Non-stream chat error: {e}", exc_info=True)
+                if acc:
+                    excluded_accounts.add(acc.email)
+                    client.account_pool.release(acc)
                 if stream_attempt == settings.MAX_RETRIES - 1:
                     raise HTTPException(status_code=500, detail=str(e))
                 await aio.sleep(1)

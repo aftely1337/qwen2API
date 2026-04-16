@@ -447,7 +447,7 @@ class QwenClient:
                 })
         return parsed
 
-    async def chat_stream_events_with_retry(self, model: str, content: str, has_custom_tools: bool = False, exclude_accounts: Optional[set[str]] = None, uploaded_files: list = None):
+    async def chat_stream_events_with_retry(self, model: str, content: str, has_custom_tools: bool = False, exclude_accounts: Optional[set[str]] = None, image_urls_for_vision: list = None):
         """无感容灾重试逻辑：上游挂了自动换号"""
         exclude = set(exclude_accounts or set())
         for attempt in range(settings.MAX_RETRIES):
@@ -463,7 +463,14 @@ class QwenClient:
                 
             chat_id: Optional[str] = None
             try:
-                log.info(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 获取账号：account={acc.email} model={model} tools={has_custom_tools} exclude={sorted(exclude)}")
+                # ── 先在这里执行上传 ──
+                uploaded_files = None
+                if image_urls_for_vision:
+                    from backend.api.v1_chat import process_image_urls
+                    uploaded_files = await process_image_urls(image_urls_for_vision, self, acc.token)
+                    log.info(f"[Vision] 成功上传了 {len(uploaded_files)} 个图片文件。")
+
+                log.info(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 获取账号：account={acc.email} model={model} tools={has_custom_tools} exclude={list(exclude)}")
                 # 本地节流：同账号两次上游请求之间保持最小间隔，降低自动化痕迹
                 min_interval = max(0, settings.ACCOUNT_MIN_INTERVAL_MS) / 1000.0
                 now = time.time()
@@ -485,6 +492,9 @@ class QwenClient:
 
                 # First yield the chat_id and account to the consumer
                 yield {"type": "meta", "chat_id": chat_id, "acc": acc}
+                
+                # Make sure acc is released if we yield and the consumer breaks the loop
+                # The caller should release, but just in case, we do it in finally if we don't return normally
 
                 buffer = ""
                 # 始终用流式模式：可实时发现 NativeBlock 并早期中止，不用等 3 分钟
@@ -492,13 +502,13 @@ class QwenClient:
                     if chunk_result.get("status") == 429:
                         log.warning(f"[本地背压 {attempt+1}/{settings.MAX_RETRIES}] 引擎队列已满：account={acc.email} chat_id={chat_id}")
                         raise Exception("local_backpressure: engine queue full")
-                    if chunk_result.get("status") != 200 and chunk_result.get("status") != "streamed":
+                    if chunk_result.get("status") not in (200, "streamed"):
                         body_preview = (chunk_result.get("body", "")[:120]).replace("\n", "\\n")
                         log.warning(
                             f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 上游分片异常：account={acc.email} chat_id={chat_id} "
                             f"status={chunk_result.get('status')} body_preview={body_preview!r}"
                         )
-                        raise Exception(f"HTTP {chunk_result['status']}: {chunk_result.get('body', '')[:100]}")
+                        raise Exception(f"HTTP {chunk_result.get('status')}: {chunk_result.get('body', '')[:100]}")
 
                     if "chunk" in chunk_result:
                         buffer += chunk_result["chunk"]
@@ -516,6 +526,7 @@ class QwenClient:
                         yield {"type": "event", "event": evt}
                 log.info(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 流式完成：account={acc.email} chat_id={chat_id} buffered_chars={len(buffer)}")
                 self.active_chat_ids.discard(chat_id)
+                # 不在这里 release acc，而是让调用者 release
                 return
 
             except Exception as e:
@@ -525,6 +536,7 @@ class QwenClient:
                 should_save = False
                 if "local_backpressure" in err_msg or "engine queue full" in err_msg:
                     acc.last_error = str(e)
+                    exclude.add(acc.email)
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 本地背压：account={acc.email} error={e}")
                 elif "429" in err_msg or "rate limit" in err_msg or "too many" in err_msg:
                     self.account_pool.mark_rate_limited(acc, error_message=str(e))
@@ -540,30 +552,43 @@ class QwenClient:
                 elif _is_banned_error(err_msg):
                     self.account_pool.mark_invalid(acc, reason="banned", error_message=str(e))
                     exclude.add(acc.email)
+                    should_save = True
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 标记为封禁：account={acc.email} error={e}")
                 elif _is_auth_error(err_msg):
                     self.account_pool.mark_invalid(acc, reason="auth_error", error_message=str(e))
                     exclude.add(acc.email)
+                    should_save = True
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 标记为鉴权失败：account={acc.email} error={e}")
                     asyncio.create_task(self.auth_resolver.auto_heal_account(acc))
                 else:
                     acc.last_error = str(e)
+                    exclude.add(acc.email)
                     log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 瞬态错误：account={acc.email} error={e}")
 
                 if should_save:
                     await self.account_pool.save()
+                    
+                if acc:
+                    self.account_pool.release(acc)
+                    
+                log.info(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 账号失败，准备重试：account={acc.email} error={e}")
 
-                self.account_pool.release(acc)
-                log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] 账号失败，准备重试：account={acc.email} error={e}")
+            except BaseException as base_e:
+                if chat_id:
+                    self.active_chat_ids.discard(chat_id)
+                log.warning(f"[重试 {attempt+1}/{settings.MAX_RETRIES}] Account {acc.email} aborted due to BaseException: {type(base_e).__name__}")
+                if acc:
+                    self.account_pool.release(acc)
+                raise
                 
         raise Exception(f"All {settings.MAX_RETRIES} attempts failed. Please check upstream accounts.")
 
-    async def chat_with_retry(self, model: str, content: str, has_custom_tools: bool = False, exclude_accounts: Optional[set[str]] = None, uploaded_files: list = None):
+    async def chat_with_retry(self, model: str, content: str, has_custom_tools: bool = False, exclude_accounts: Optional[set[str]] = None, image_urls_for_vision: list = None):
         """一次性返回所有对话结果"""
         events = []
         chat_id_out = None
         acc_out = None
-        async for item in self.chat_stream_events_with_retry(model, content, has_custom_tools, exclude_accounts, uploaded_files):
+        async for item in self.chat_stream_events_with_retry(model, content, has_custom_tools, exclude_accounts, image_urls_for_vision):
             if item["type"] == "meta":
                 chat_id_out = item["chat_id"]
                 acc_out = item["acc"]

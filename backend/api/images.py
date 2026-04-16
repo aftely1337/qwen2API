@@ -120,9 +120,10 @@ async def create_image(request: Request):
     try:
         answer_text, acc, chat_id = await client.image_generate_with_retry(model, prompt)
 
-        # 后台清理会话
-        client.account_pool.release(acc)
-        asyncio.create_task(client.delete_chat(acc.token, chat_id))
+        if acc:
+            client.account_pool.release(acc)
+            if chat_id:
+                asyncio.create_task(client.delete_chat(acc.token, chat_id))
 
         # 提取图片 URL
         image_urls = _extract_image_urls(answer_text)
