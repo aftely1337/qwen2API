@@ -23,11 +23,46 @@ from backend.core.httpx_engine import HttpxEngine
 from backend.core.hybrid_engine import HybridEngine
 from backend.core.account_pool import AccountPool
 from backend.services.qwen_client import QwenClient
+from backend.services.auto_registrar import QwenAutoRegistrar
 from backend.api import admin, v1_chat, probes, anthropic, gemini, embeddings, images
 from backend.services.garbage_collector import garbage_collect_chats
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("qwen2api")
+
+async def background_auto_refill_task(pool):
+    TARGET_MIN_ACCOUNTS = 3
+    registrar = QwenAutoRegistrar()
+    
+    while True:
+        try:
+            # Count healthy accounts (status=200, not rate limited)
+            healthy_count = sum(
+                1 for acc in pool.accounts 
+                if acc.status_code == 200 and not acc.is_rate_limited()
+            )
+            
+            if healthy_count < TARGET_MIN_ACCOUNTS:
+                log.info(f"[Daemon] Healthy accounts ({healthy_count}) < target ({TARGET_MIN_ACCOUNTS}). Starting auto-refill...")
+                try:
+                    new_acc = await registrar.register_account()
+                    await pool.add(new_acc)
+                    log.info(f"[Daemon] Auto-refill successful. Added {new_acc.email}.")
+                    # Wait a bit before registering another one to avoid suspicion
+                    await asyncio.sleep(10)
+                except Exception as e:
+                    log.error(f"[Daemon] Auto-refill failed: {e}. Backing off for 5 minutes.")
+                    await asyncio.sleep(300) # 5 minutes backoff on failure
+            else:
+                # Pool is healthy, check again in 5 minutes
+                await asyncio.sleep(300)
+                
+        except asyncio.CancelledError:
+            log.info("[Daemon] Auto-refill task cancelled.")
+            break
+        except Exception as e:
+            log.error(f"[Daemon] Unexpected error in auto-refill task: {e}")
+            await asyncio.sleep(60)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -60,10 +95,14 @@ async def lifespan(app: FastAPI):
     await engine.start()
 
     asyncio.create_task(garbage_collect_chats(app.state.qwen_client))
+    
+    # Start daemon
+    refill_task = asyncio.create_task(background_auto_refill_task(app.state.account_pool))
 
     yield
 
     log.info("Shutting down gateway...")
+    refill_task.cancel()
     await app.state.gateway_engine.stop()
 
 app = FastAPI(title="qwen2API Enterprise Gateway", version="2.0.0", lifespan=lifespan)

@@ -4,9 +4,12 @@ from pydantic import BaseModel
 from backend.core.config import settings
 from backend.core.database import AsyncJsonDB
 from backend.core.account_pool import AccountPool, Account
+from backend.services.auto_registrar import QwenAutoRegistrar, RegistrationError
 
 router = APIRouter()
 
+class GenerateAccountsRequest(BaseModel):
+    count: int = 1
 
 def verify_admin(authorization: str = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
@@ -165,6 +168,35 @@ async def list_accounts(request: Request):
         item["last_error"] = a.last_error
         accounts.append(item)
     return {"accounts": accounts}
+
+
+@router.post("/accounts/generate", dependencies=[Depends(verify_admin)])
+async def generate_accounts(req: GenerateAccountsRequest, request: Request):
+    """Generate N new accounts automatically via TempMail and Qwen Registration."""
+    count = max(1, min(req.count, 10)) # Limit to 10 at a time
+    registrar = QwenAutoRegistrar()
+    pool: AccountPool = request.app.state.account_pool
+    
+    results = []
+    errors = []
+    
+    # Process sequentially to avoid aggressive IP bans from Qwen
+    for i in range(count):
+        try:
+            new_acc = await registrar.register_account()
+            await pool.add(new_acc)
+            results.append(new_acc.email)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            errors.append(str(e))
+            
+    return {
+        "success_count": len(results),
+        "error_count": len(errors),
+        "emails": results,
+        "errors": errors
+    }
 
 
 @router.post("/accounts/register-verify", dependencies=[Depends(verify_admin)])

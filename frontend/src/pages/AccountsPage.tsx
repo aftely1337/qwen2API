@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react"
 import { Button } from "../components/ui/button"
-import { Trash2, Plus, RefreshCw, Bot, ShieldCheck, MailWarning } from "lucide-react"
+import { Trash2, Plus, RefreshCw, Bot, ShieldCheck, MailWarning, Loader2, Zap } from "lucide-react"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
@@ -76,6 +76,36 @@ export default function AccountsPage() {
   const [registerUnlocked, setRegisterUnlocked] = useState(false)
   const [verifying, setVerifying] = useState<string | null>(null)
   const [verifyingAll, setVerifyingAll] = useState(false)
+
+  const [isGenerating, setIsGenerating] = useState(false)
+  const [generateCount, setGenerateCount] = useState(1)
+  const [showGenerateModal, setShowGenerateModal] = useState(false)
+
+  const handleGenerate = async () => {
+    setIsGenerating(true)
+    const id = toast.loading("\u6b63\u5728\u751f\u6210\u8d26\u53f7...")
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/accounts/generate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...getAuthHeader()
+        },
+        body: JSON.stringify({ count: generateCount })
+      })
+      
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || "\u751f\u6210\u8d26\u53f7\u5931\u8d25")
+      
+      toast.success(`\u6210\u529f\u751f\u6210\u4e86 ${data.success_count} \u4e2a\u8d26\u53f7\u3002`, { id, duration: 8000 })
+      setShowGenerateModal(false)
+      fetchAccounts() // Refresh the table
+    } catch (err: unknown) {
+      toast.error(err instanceof Error ? err.message : String(err), { id, duration: 8000 })
+    } finally {
+      setIsGenerating(false)
+    }
+  }
 
   // 邮箱+密码字段同时匹配时解锁注册功能
   useEffect(() => {
@@ -250,6 +280,9 @@ export default function AccountsPage() {
           <Button variant="outline" onClick={() => { fetchAccounts(); toast.success("\u8d26\u53f7\u5217\u8868\u5df2\u5237\u65b0") }}>
             <RefreshCw className="mr-2 h-4 w-4" /> {"\u5237\u65b0\u72b6\u6001"}
           </Button>
+          <Button className="bg-purple-600 hover:bg-purple-700 text-white" onClick={() => setShowGenerateModal(true)}>
+            <Zap className="mr-2 h-4 w-4" /> {"\u81ea\u52a8\u751f\u6210"}
+          </Button>
           {registerUnlocked && (
             <Button variant="default" onClick={handleAutoRegister} disabled={registering}>
               {registering ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" /> : <Bot className="mr-2 h-4 w-4" />}
@@ -348,6 +381,48 @@ export default function AccountsPage() {
           </tbody>
         </table>
       </div>
+
+      {showGenerateModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-zinc-900 rounded-lg p-6 w-full max-w-md">
+            <h3 className="text-xl font-semibold mb-4">{"\u81ea\u52a8\u751f\u6210\u8d26\u53f7"}</h3>
+            <p className="text-muted-foreground mb-4 text-sm">
+              {"\u5c06\u4f7f\u7528 tempmail.lol \u81ea\u52a8\u6ce8\u518c\u65b0\u7684 Qwen \u8d26\u53f7\u5e76\u6dfb\u52a0\u5230\u8d26\u53f7\u6c60\u3002"}
+            </p>
+            
+            <div className="mb-4">
+              <label className="block text-sm font-medium mb-1">{"\u751f\u6210\u6570\u91cf"}</label>
+              <input
+                type="number"
+                min="1"
+                max="10"
+                value={generateCount}
+                onChange={(e) => setGenerateCount(parseInt(e.target.value) || 1)}
+                className="w-full px-3 py-2 border border-input bg-background rounded-md"
+                disabled={isGenerating}
+              />
+            </div>
+
+            <div className="flex justify-end space-x-3 mt-6">
+              <Button
+                variant="outline"
+                onClick={() => setShowGenerateModal(false)}
+                disabled={isGenerating}
+              >
+                {"\u53d6\u6d88"}
+              </Button>
+              <Button
+                onClick={handleGenerate}
+                disabled={isGenerating}
+                className="bg-purple-600 hover:bg-purple-700 text-white"
+              >
+                {isGenerating ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
+                {isGenerating ? "\u751f\u6210\u4e2d..." : "\u5f00\u59cb\u751f\u6210"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
