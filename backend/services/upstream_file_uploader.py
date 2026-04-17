@@ -13,12 +13,23 @@ import oss2
 def _file_class_from_content_type(content_type: str) -> str:
     lowered = (content_type or "").lower()
     if lowered.startswith("image/"):
-        return "image"
+        return "vision"
     if lowered.startswith("audio/"):
         return "audio"
     if lowered.startswith("video/"):
         return "video"
     return "document"
+
+
+def _upstream_filetype_from_content_type(content_type: str) -> str:
+    lowered = (content_type or "").lower()
+    if lowered.startswith("image/"):
+        return "image"
+    if lowered.startswith("audio/"):
+        return "audio"
+    if lowered.startswith("video/"):
+        return "video"
+    return "file"
 
 
 def _normalize_sign_region(region: str) -> str:
@@ -38,6 +49,7 @@ class UpstreamFileUploader:
         file_path = local_file_meta["path"]
         content_type = local_file_meta.get("content_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
         raw = Path(file_path).read_bytes()
+        is_image = content_type.startswith("image/")
 
         sts_resp = await self.client._request_json(
             "POST",
@@ -46,7 +58,7 @@ class UpstreamFileUploader:
             {
                 "filename": filename,
                 "filesize": len(raw),
-                "filetype": "file",
+                "filetype": _upstream_filetype_from_content_type(content_type),
             },
             timeout=20.0,
         )
@@ -121,8 +133,16 @@ class UpstreamFileUploader:
         user_id = file_path_remote.split('/', 1)[0] if '/' in file_path_remote else ""
         now_ms = int(time.time() * 1000)
         put_url = f"https://{bucketname}.{endpoint}/{file_path_remote.lstrip('/')}"
+        file_url = sts.get("file_url") or put_url
+        file_meta = {
+            "name": filename,
+            "size": len(raw),
+            "content_type": content_type,
+        }
+        if not is_image:
+            file_meta["parse_meta"] = {"parse_status": parse_status}
         remote_ref = {
-            "type": "file",
+            "type": "image" if is_image else "file",
             "file": {
                 "created_at": now_ms,
                 "data": {},
@@ -130,16 +150,11 @@ class UpstreamFileUploader:
                 "hash": None,
                 "id": file_id,
                 "user_id": user_id,
-                "meta": {
-                    "name": filename,
-                    "size": len(raw),
-                    "content_type": content_type,
-                    "parse_meta": {"parse_status": parse_status},
-                },
+                "meta": file_meta,
                 "update_at": now_ms,
             },
             "id": file_id,
-            "url": put_url,
+            "url": file_url,
             "name": filename,
             "collection_name": "",
             "progress": 0,
@@ -149,7 +164,7 @@ class UpstreamFileUploader:
             "error": "",
             "itemId": str(uuid.uuid4()),
             "file_type": content_type,
-            "showType": "file",
+            "showType": "image" if is_image else "file",
             "file_class": _file_class_from_content_type(content_type),
             "uploadTaskId": str(uuid.uuid4()),
         }

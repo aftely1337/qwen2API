@@ -5,14 +5,6 @@ import { Button } from "../components/ui/button"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
 
-const SIZES = [
-  { label: "1:1", value: "1024x1024" },
-  { label: "16:9", value: "1024x576" },
-  { label: "9:16", value: "576x1024" },
-  { label: "4:3", value: "1024x768" },
-  { label: "3:4", value: "768x1024" },
-]
-
 type EditedImage = {
   url: string
   revised_prompt: string
@@ -37,7 +29,6 @@ export default function ImageEditPage() {
   const [prompt, setPrompt] = useState("")
   const [imageFile, setImageFile] = useState<File | null>(null)
   const [maskFile, setMaskFile] = useState<File | null>(null)
-  const [size, setSize] = useState("1024x1024")
   const [n, setN] = useState(1)
   const [loading, setLoading] = useState(false)
   const [results, setResults] = useState<EditedImage[]>([])
@@ -67,7 +58,6 @@ export default function ImageEditPage() {
       }
       formData.append("prompt", prompt.trim())
       formData.append("n", String(n))
-      formData.append("size", size)
       formData.append("model", "dall-e-3")
 
       const res = await fetch(`${API_BASE}/v1/images/edits`, {
@@ -131,7 +121,9 @@ export default function ImageEditPage() {
               className="block w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
               disabled={loading}
             />
-            <p className="text-xs text-muted-foreground">支持 png / jpg / webp 等常见格式。</p>
+            <p className="text-xs text-muted-foreground">
+              支持 png / jpg / webp 等常见格式。图像编辑默认继承原图比例。
+            </p>
           </div>
 
           <div className="space-y-2">
@@ -160,27 +152,6 @@ export default function ImageEditPage() {
         </div>
 
         <div className="flex flex-wrap items-end gap-4">
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium">输出尺寸</label>
-            <div className="flex gap-2 flex-wrap">
-              {SIZES.map((option) => (
-                <button
-                  key={option.value}
-                  type="button"
-                  onClick={() => setSize(option.value)}
-                  disabled={loading}
-                  className={`px-3 py-1.5 rounded-md text-sm font-medium border transition-all ${
-                    size === option.value
-                      ? "bg-primary text-primary-foreground border-primary shadow-sm"
-                      : "bg-background border-border text-muted-foreground hover:text-foreground hover:border-foreground/30"
-                  }`}
-                >
-                  {option.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
           <div className="space-y-1.5">
             <label className="text-sm font-medium">生成数量</label>
             <div className="flex gap-2">

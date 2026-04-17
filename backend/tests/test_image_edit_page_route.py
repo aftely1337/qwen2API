@@ -17,3 +17,10 @@ class ImageEditPageRouteTests(unittest.TestCase):
 
         self.assertIn("/v1/images/edits", page)
         self.assertIn("图像编辑", page)
+
+    def test_image_edit_page_no_longer_offers_ratio_selector(self):
+        page = (ROOT / "frontend" / "src" / "pages" / "ImageEditPage.tsx").read_text(encoding="utf-8")
+
+        self.assertIn("默认继承原图比例", page)
+        self.assertNotIn("输出尺寸", page)
+        self.assertNotIn('formData.append("size"', page)
