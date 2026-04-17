@@ -1,34 +1,34 @@
 import asyncio
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-import os
 
-# Windows UTF-8 输出修复
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-
-# 将项目根目录加入到 sys.path，解决直接运行 main.py 时找不到 backend 模块的问题
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from backend.core.account_pool import AccountPool
 from backend.core.config import settings
 from backend.core.database import AsyncJsonDB
-from backend.core.browser_engine import BrowserEngine
-from backend.core.httpx_engine import HttpxEngine
-from backend.core.hybrid_engine import HybridEngine
-from backend.core.account_pool import AccountPool
-from backend.services.qwen_client import QwenClient
+from backend.core.request_logging import configure_logging, request_context
+from backend.core.session_affinity import SessionAffinityStore
+from backend.core.session_lock import SessionLockRegistry
+from backend.core.upstream_file_cache import UpstreamFileCache
 from backend.services.account_health import count_healthy_accounts
 from backend.services.auto_registrar import QwenAutoRegistrar
-from backend.api import admin, v1_chat, probes, anthropic, gemini, embeddings, images
+from backend.services.context_cleanup import context_cleanup_loop
+from backend.services.context_offload import ContextOffloader
+from backend.services.file_store import LocalFileStore
 from backend.services.garbage_collector import garbage_collect_chats
+from backend.services.qwen_client import QwenClient
+from backend.services.upstream_file_uploader import UpstreamFileUploader
+import backend.api.models as models
+from backend.api import admin, anthropic, embeddings, files_api, gemini, images, probes, v1_chat
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+configure_logging(getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO))
 log = logging.getLogger("qwen2api")
 
 
@@ -46,9 +46,9 @@ async def sleep_or_wake(delay_seconds: float, wake_event: asyncio.Event | None =
         wake_event.clear()
 
 
-async def background_auto_refill_task(pool, wake_event: asyncio.Event | None = None):
+async def background_auto_refill_task(pool: AccountPool, wake_event: asyncio.Event | None = None):
     registrar = QwenAutoRegistrar()
-    
+
     while True:
         try:
             target_min_accounts = max(0, int(getattr(settings, "AUTO_REFILL_TARGET_MIN_ACCOUNTS", 3) or 0))
@@ -56,24 +56,19 @@ async def background_auto_refill_task(pool, wake_event: asyncio.Event | None = N
                 await sleep_or_wake(300, wake_event)
                 continue
 
-            # Count healthy accounts (status=200, not rate limited)
             healthy_count = count_healthy_accounts(pool.accounts)
-            
             if healthy_count < target_min_accounts:
                 log.info(f"[Daemon] Healthy accounts ({healthy_count}) < target ({target_min_accounts}). Starting auto-refill...")
                 try:
                     new_acc = await registrar.register_account()
                     await pool.add(new_acc)
                     log.info(f"[Daemon] Auto-refill successful. Added {new_acc.email}.")
-                    # Wait a bit before registering another one to avoid suspicion
                     await sleep_or_wake(10, wake_event)
                 except Exception as e:
                     log.error(f"[Daemon] Auto-refill failed: {e}. Backing off for 5 minutes.")
-                    await sleep_or_wake(300, wake_event) # 5 minutes backoff on failure
+                    await sleep_or_wake(300, wake_event)
             else:
-                # Pool is healthy, check again in 5 minutes
                 await sleep_or_wake(300, wake_event)
-                
         except asyncio.CancelledError:
             log.info("[Daemon] Auto-refill task cancelled.")
             break
@@ -81,47 +76,50 @@ async def background_auto_refill_task(pool, wake_event: asyncio.Event | None = N
             log.error(f"[Daemon] Unexpected error in auto-refill task: {e}")
             await sleep_or_wake(60, wake_event)
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting qwen2API v2.0 Enterprise Gateway...")
+    with request_context(surface="startup"):
+        log.info("正在启动 qwen2API v2.0 企业网关...")
 
-    app.state.accounts_db = AsyncJsonDB(settings.ACCOUNTS_FILE, default_data=[])
-    app.state.users_db = AsyncJsonDB(settings.USERS_FILE, default_data=[])
-    app.state.captures_db = AsyncJsonDB(settings.CAPTURES_FILE, default_data=[])
+        app.state.accounts_db = AsyncJsonDB(settings.ACCOUNTS_FILE, default_data=[])
+        app.state.users_db = AsyncJsonDB(settings.USERS_FILE, default_data=[])
+        app.state.captures_db = AsyncJsonDB(settings.CAPTURES_FILE, default_data=[])
+        app.state.session_affinity_db = AsyncJsonDB(settings.CONTEXT_AFFINITY_FILE, default_data=[])
+        app.state.context_cache_db = AsyncJsonDB(settings.CONTEXT_CACHE_FILE, default_data=[])
+        app.state.uploaded_files_db = AsyncJsonDB(settings.UPLOADED_FILES_FILE, default_data=[])
 
-    browser_engine = BrowserEngine(pool_size=settings.BROWSER_POOL_SIZE)
-    httpx_engine = HttpxEngine(base_url="https://chat.qwen.ai")
+        app.state.account_pool = AccountPool(app.state.accounts_db, max_inflight=settings.MAX_INFLIGHT_PER_ACCOUNT)
+        app.state.qwen_client = QwenClient(app.state.account_pool)
+        app.state.qwen_executor = app.state.qwen_client.executor
+        app.state.browser_engine = None
+        app.state.httpx_engine = None
+        app.state.gateway_engine = None
+        app.state.file_store = LocalFileStore(settings.CONTEXT_GENERATED_DIR, app.state.uploaded_files_db)
+        app.state.session_affinity = SessionAffinityStore(app.state.session_affinity_db)
+        app.state.upstream_file_cache = UpstreamFileCache(app.state.context_cache_db)
+        app.state.context_offloader = ContextOffloader(settings)
+        app.state.upstream_file_uploader = UpstreamFileUploader(app.state.qwen_client, settings)
+        app.state.session_locks = SessionLockRegistry()
+        app.state.auto_refill_wakeup = asyncio.Event()
 
-    if settings.ENGINE_MODE == "httpx":
-        engine = httpx_engine
-        log.info("引擎模式: httpx 直连")
-    elif settings.ENGINE_MODE == "hybrid":
-        engine = HybridEngine(browser_engine, httpx_engine)
-        log.info("引擎模式: Hybrid (api_call=httpx优先, fetch_chat=browser)")
-    else:
-        engine = browser_engine
-        log.info("引擎模式: Camoufox 浏览器")
+        await app.state.account_pool.load()
+        await app.state.file_store.load()
+        await app.state.session_affinity.load()
+        await app.state.upstream_file_cache.load()
 
-    app.state.browser_engine = browser_engine
-    app.state.httpx_engine = httpx_engine
-    app.state.gateway_engine = engine
-    app.state.account_pool = AccountPool(app.state.accounts_db, max_inflight=settings.MAX_INFLIGHT_PER_ACCOUNT)
-    app.state.qwen_client = QwenClient(engine, app.state.account_pool)
-
-    await app.state.account_pool.load()
-    await engine.start()
-
-    asyncio.create_task(garbage_collect_chats(app.state.qwen_client))
-    
-    # Start daemon
-    app.state.auto_refill_wakeup = asyncio.Event()
-    refill_task = asyncio.create_task(background_auto_refill_task(app.state.account_pool, app.state.auto_refill_wakeup))
+        gc_task = asyncio.create_task(garbage_collect_chats(app))
+        cleanup_task = asyncio.create_task(context_cleanup_loop(app))
+        refill_task = asyncio.create_task(background_auto_refill_task(app.state.account_pool, app.state.auto_refill_wakeup))
 
     yield
 
-    log.info("Shutting down gateway...")
-    refill_task.cancel()
-    await app.state.gateway_engine.stop()
+    with request_context(surface="shutdown"):
+        log.info("正在关闭网关服务...")
+        refill_task.cancel()
+        cleanup_task.cancel()
+        gc_task.cancel()
+
 
 app = FastAPI(title="qwen2API Enterprise Gateway", version="2.0.0", lifespan=lifespan)
 
@@ -133,28 +131,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 挂载路由
 app.include_router(v1_chat.router, tags=["OpenAI Compatible"])
-app.include_router(images.router, tags=["Image Generation"])
+app.include_router(models.router, tags=["Models"])
 app.include_router(anthropic.router, tags=["Claude Compatible"])
 app.include_router(gemini.router, tags=["Gemini Compatible"])
 app.include_router(embeddings.router, tags=["Embeddings"])
+app.include_router(images.router, tags=["Images"])
+app.include_router(files_api.router, tags=["Files"])
 app.include_router(probes.router, tags=["Probes"])
 app.include_router(admin.router, prefix="/api/admin", tags=["Dashboard Admin"])
+
 
 @app.get("/api", tags=["System"])
 async def root():
     return {
         "status": "qwen2API Enterprise Gateway is running",
         "docs": "/docs",
-        "version": "2.0.0"
+        "version": "2.0.0",
     }
 
-# 托管前端构建产物（仅当 dist 存在时，即生产打包模式）
+
 FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend", "dist")
 if os.path.exists(FRONTEND_DIST):
     app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+else:
+    log.warning(f"未找到前端构建目录: {FRONTEND_DIST}，WebUI 将不可用。")
+
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("backend.main:app", host="0.0.0.0", port=settings.PORT, workers=1)

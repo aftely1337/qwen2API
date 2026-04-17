@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import json
 import tempfile
 import unittest
@@ -59,3 +60,8 @@ class AutoRefillTargetSettingTests(unittest.TestCase):
         self.assertIn("auto_refill_target_min_accounts", settings_page)
         self.assertIn(AUTO_REFILL_LABEL, settings_page)
         self.assertIn("AUTO_REFILL_TARGET_MIN_ACCOUNTS", main_py)
+
+    def test_backend_main_imports_successfully(self):
+        module = importlib.import_module("backend.main")
+
+        self.assertTrue(hasattr(module, "app"))
