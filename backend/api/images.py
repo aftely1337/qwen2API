@@ -199,9 +199,10 @@ async def edit_image(
             async for item in client.chat_stream_events_with_retry(
                 model_resolved,
                 prompt_text,
-                has_custom_tools=False, is_image_edit=True,
+                has_custom_tools=False,
                 files=[remote_ref],
-                fixed_account=acc
+                fixed_account=acc,
+                chat_type="image_edit"
             ):
                 if item.get("type") == "meta":
                     chat_id = item.get("chat_id")
