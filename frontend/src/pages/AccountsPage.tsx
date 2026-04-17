@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react"
 import { Button } from "../components/ui/button"
-import { Trash2, Plus, RefreshCw, Bot, ShieldCheck, MailWarning, Loader2, Zap } from "lucide-react"
+import { Trash2, Plus, RefreshCw, ShieldCheck, MailWarning, Loader2, Zap, Download, Upload } from "lucide-react"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
@@ -64,22 +64,21 @@ function localizeError(error?: string) {
   return error
 }
 
-// SHA-256("yangAdmin::A15935700a@") — one-way hash, credentials not recoverable from source
-const _UH = "29bb93e7473e47595a454ea0c7996f659035bc5298faf820039fbf7641906aea"
 
 export default function AccountsPage() {
   const [accounts, setAccounts] = useState<AccountItem[]>([])
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
   const [token, setToken] = useState("")
-  const [registering, setRegistering] = useState(false)
-  const [registerUnlocked, setRegisterUnlocked] = useState(false)
   const [verifying, setVerifying] = useState<string | null>(null)
   const [verifyingAll, setVerifyingAll] = useState(false)
 
   const [isGenerating, setIsGenerating] = useState(false)
   const [generateCount, setGenerateCount] = useState(1)
   const [showGenerateModal, setShowGenerateModal] = useState(false)
+  const [isExporting, setIsExporting] = useState(false)
+  const [isImporting, setIsImporting] = useState(false)
+  const importFileRef = useRef<HTMLInputElement | null>(null)
 
   const handleGenerate = async () => {
     setIsGenerating(true)
@@ -107,15 +106,87 @@ export default function AccountsPage() {
     }
   }
 
-  // 邮箱+密码字段同时匹配时解锁注册功能
-  useEffect(() => {
-    if (!email || !password) return
-    crypto.subtle.digest("SHA-256", new TextEncoder().encode(email + "::" + password))
-      .then(buf => {
-        const hex = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("")
-        if (hex === _UH) setRegisterUnlocked(true)
+  const handleExport = async () => {
+    setIsExporting(true)
+    const id = toast.loading("正在导出账号...")
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/accounts/export`, {
+        headers: getAuthHeader(),
       })
-  }, [email, password])
+
+      if (!res.ok) {
+        let message = "导出账号失败"
+        try {
+          const data = await res.json()
+          message = data.detail || message
+        } catch {
+          // ignore non-json error bodies
+        }
+        throw new Error(message)
+      }
+
+      const blob = await res.blob()
+      const disposition = res.headers.get("Content-Disposition") || ""
+      const matched = disposition.match(/filename=\"?([^"]+)\"?/)
+      const filename = matched?.[1] || `accounts-export-${Date.now()}.json`
+      const downloadUrl = URL.createObjectURL(blob)
+      const anchor = document.createElement("a")
+      anchor.href = downloadUrl
+      anchor.download = filename
+      document.body.appendChild(anchor)
+      anchor.click()
+      document.body.removeChild(anchor)
+      URL.revokeObjectURL(downloadUrl)
+      toast.success("账号已导出", { id })
+    } catch (err: unknown) {
+      toast.error(err instanceof Error ? err.message : String(err), { id, duration: 8000 })
+    } finally {
+      setIsExporting(false)
+    }
+  }
+
+  const handleOpenImport = () => {
+    importFileRef.current?.click()
+  }
+
+  const handleImportFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+
+    setIsImporting(true)
+    const id = toast.loading(`正在导入账号：${file.name}`)
+    try {
+      const raw = await file.text()
+      const payload = JSON.parse(raw)
+
+      const res = await fetch(`${API_BASE}/api/admin/accounts/import`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...getAuthHeader(),
+        },
+        body: JSON.stringify(payload),
+      })
+
+      const data = await res.json()
+      if (!res.ok) {
+        throw new Error(data.detail || "导入账号失败")
+      }
+
+      toast.success(`成功导入 ${data.imported} 个账号，覆盖 ${data.replaced} 个。`, { id, duration: 8000 })
+      fetchAccounts()
+    } catch (err: unknown) {
+      if (err instanceof SyntaxError) {
+        toast.error("导入文件不是有效的 JSON", { id, duration: 8000 })
+      } else {
+        toast.error(err instanceof Error ? err.message : String(err), { id, duration: 8000 })
+      }
+    } finally {
+      event.target.value = ""
+      setIsImporting(false)
+    }
+  }
+
 
   const fetchAccounts = () => {
     fetch(`${API_BASE}/api/admin/accounts`, { headers: getAuthHeader() })
@@ -124,7 +195,7 @@ export default function AccountsPage() {
         return res.json()
       })
       .then(data => setAccounts(data.accounts || []))
-      .catch(() => toast.error("\u5237\u65b0\u8d26\u53f7\u5217\u8868\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5\u4f1a\u8bdd\u5bc6\u94a5"))
+      .catch(() => toast.error("刷新账号列表失败，请检查右下角的管理 Key"))
   }
 
   useEffect(() => {
@@ -184,29 +255,6 @@ export default function AccountsPage() {
       toast.success(`\u5df2\u5220\u9664 ${targetEmail}`, { id })
       fetchAccounts()
     }).catch(() => toast.error("\u5220\u9664\u8d26\u53f7\u5931\u8d25", { id }))
-  }
-
-  const handleAutoRegister = () => {
-    setRegistering(true)
-    const id = toast.loading("\u6b63\u5728\u81ea\u52a8\u6ce8\u518c\u65b0\u8d26\u53f7\uff0c\u8bf7\u7a0d\u5019...")
-    fetch(`${API_BASE}/api/admin/accounts/register`, {
-      method: "POST",
-      headers: getAuthHeader(),
-    }).then(res => res.json())
-      .then(data => {
-        if (data.activation_pending) {
-          toast.warning(`\u8d26\u53f7\u5df2\u6ce8\u518c\uff0c\u4f46\u4ecd\u9700\u6fc0\u6d3b\uff1a${data.email}`, { id, duration: 8000 })
-          fetchAccounts()
-        } else if (data.ok) {
-          toast.success(data.message || `\u6ce8\u518c\u6210\u529f\uff1a${data.email}`, { id, duration: 8000 })
-          fetchAccounts()
-        } else {
-          toast.error(localizeError(data.error) || "\u81ea\u52a8\u6ce8\u518c\u5931\u8d25", { id, duration: 8000 })
-          if (data.email) fetchAccounts()
-        }
-      })
-      .catch(() => toast.error("\u81ea\u52a8\u6ce8\u518c\u8bf7\u6c42\u5931\u8d25", { id }))
-      .finally(() => setRegistering(false))
   }
 
   const handleVerify = (targetEmail: string) => {
@@ -273,7 +321,22 @@ export default function AccountsPage() {
           <h2 className="text-3xl font-extrabold tracking-tight">{"\u8d26\u53f7\u7ba1\u7406"}</h2>
           <p className="text-muted-foreground mt-1">{"\u7edf\u4e00\u7ba1\u7406\u4e0a\u6e38\u8d26\u53f7\u6c60\uff0c\u5e76\u533a\u5206\u672a\u6fc0\u6d3b\u3001\u9650\u6d41\u3001\u5c01\u7981\u4e0e\u5931\u6548\u72b6\u6001\u3002"}</p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2 justify-end">
+          <input
+            ref={importFileRef}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            onChange={handleImportFile}
+          />
+          <Button variant="outline" onClick={handleExport} disabled={isExporting}>
+            {isExporting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Download className="mr-2 h-4 w-4" />}
+            {"导出账号"}
+          </Button>
+          <Button variant="outline" onClick={handleOpenImport} disabled={isImporting}>
+            {isImporting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Upload className="mr-2 h-4 w-4" />}
+            {"导入账号"}
+          </Button>
           <Button variant="secondary" onClick={handleVerifyAll} disabled={verifyingAll}>
             <ShieldCheck className={`mr-2 h-4 w-4 ${verifyingAll ? 'animate-pulse' : ''}`} /> {"\u5168\u91cf\u5de1\u68c0"}
           </Button>
@@ -283,12 +346,6 @@ export default function AccountsPage() {
           <Button className="bg-purple-600 hover:bg-purple-700 text-white" onClick={() => setShowGenerateModal(true)}>
             <Zap className="mr-2 h-4 w-4" /> {"\u81ea\u52a8\u751f\u6210"}
           </Button>
-          {registerUnlocked && (
-            <Button variant="default" onClick={handleAutoRegister} disabled={registering}>
-              {registering ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" /> : <Bot className="mr-2 h-4 w-4" />}
-              {registering ? "\u6b63\u5728\u6ce8\u518c..." : "\u4e00\u952e\u83b7\u53d6\u65b0\u53f7"}
-            </Button>
-          )}
         </div>
       </div>
 
@@ -342,7 +399,7 @@ export default function AccountsPage() {
           <tbody className="divide-y divide-border/50">
             {accounts.length === 0 && (
               <tr>
-                <td colSpan={5} className="px-6 py-12 text-center text-muted-foreground">{"\u6682\u65e0\u8d26\u53f7\uff0c\u8bf7\u624b\u52a8\u6ce8\u5165\u6216\u4e00\u952e\u83b7\u53d6\u65b0\u53f7\u3002"}</td>
+                <td colSpan={5} className="px-6 py-12 text-center text-muted-foreground">{"\u6682\u65e0\u8d26\u53f7\uff0c\u8bf7\u624b\u52a8\u6ce8\u5165\u6216\u81ea\u52a8\u751f\u6210\u8d26\u53f7\u3002"}</td>
               </tr>
             )}
             {accounts.map(acc => (

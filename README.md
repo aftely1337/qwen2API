@@ -330,7 +330,6 @@ python start.py
 | `ADMIN_KEY` | `change-me-now` / `admin` | 管理台管理员密钥。建议部署后立即修改。 |
 | `PORT` | `7860` | 后端服务监听端口。 |
 | `WORKERS` | `1` 或 `3` | Uvicorn worker 数量。单实例环境建议 1。 |
-| `REGISTER_SECRET` | 空 | 用户注册密钥。为空时表示不限制注册。 |
 
 ### 引擎参数
 

@@ -14,7 +14,7 @@ export default function Dashboard() {
         return res.json()
       })
       .then(data => setStatus(data))
-      .catch(() => toast.error("状态获取失败，请在「系统设置」检查您的当前会话 Key。"))
+      .catch(() => toast.error("状态获取失败，请检查右下角的管理 Key。"))
   }, [])
 
   return (

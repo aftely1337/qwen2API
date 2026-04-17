@@ -662,7 +662,12 @@ async def _login_and_get_token(page, email: str, password: str, timeout_sec: int
         await asyncio.sleep(1)
     return ""
 
-from .mail_session import MailSession
+async def _poll_activation_link_for_email(email: str, timeout: int = 30) -> str:
+    async with _AsyncMailClient() as mail_client:
+        link = await mail_client.get_verify_link_for_email(email, timeout_sec=timeout)
+    if link:
+        return link
+    return await _find_verify_link_via_mail_page(email)
 
 async def activate_account(acc: Account) -> bool:
         if not acc.email or not acc.password:
@@ -671,15 +676,15 @@ async def activate_account(acc: Account) -> bool:
 
         log.info(f"[激活] 开始激活账号 {acc.email}")
         try:
+            import httpx
+
             # Step 1: Start polling email FIRST
-            mail_session = MailSession(acc.email)
             log.info(f"[MailSession] Polling inbox for {acc.email} (timeout 30s)...")
-            mail_task = asyncio.create_task(mail_session.poll_activation_link(timeout=30))
+            mail_task = asyncio.create_task(_poll_activation_link_for_email(acc.email, timeout=30))
 
             # 由于环境缺少浏览器依赖，我们只尝试通过 HTTPX 直接进行登录以触发邮件
             try:
                 # 构造基本的登录请求来触发邮件发送
-                import httpx
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     resp = await client.post("https://chat.qwen.ai/api/v1/auth/login", json={
                         "email": acc.email,

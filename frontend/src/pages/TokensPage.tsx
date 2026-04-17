@@ -16,7 +16,7 @@ export default function TokensPage() {
         return res.json()
       })
       .then(data => setKeys(data.keys || []))
-      .catch(() => toast.error("刷新失败，请检查会话 Key"))
+      .catch(() => toast.error("刷新失败，请检查右下角的管理 Key"))
   }
 
   useEffect(() => {

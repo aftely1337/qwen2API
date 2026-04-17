@@ -1,12 +1,20 @@
 import time
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from backend.core.config import settings
+from backend.core.config import settings, save_runtime_config
 from backend.core.database import AsyncJsonDB
 from backend.core.account_pool import AccountPool, Account
-from backend.services.auto_registrar import QwenAutoRegistrar, RegistrationError
+from backend.services.auto_registrar import QwenAutoRegistrar
 
 router = APIRouter()
+
+
+def wake_auto_refill_task(request: Request):
+    wake_event = getattr(request.app.state, "auto_refill_wakeup", None)
+    if wake_event is not None:
+        wake_event.set()
 
 class GenerateAccountsRequest(BaseModel):
     count: int = 1
@@ -25,6 +33,77 @@ def verify_admin(authorization: str = Header(None)):
 class UserCreate(BaseModel):
     name: str
     quota: int = 1000000
+
+
+def build_account_export_payload(accounts: list[Account]) -> dict:
+    return {
+        "version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "count": len(accounts),
+        "accounts": [account.to_dict() for account in accounts],
+    }
+
+
+def _coerce_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_int(value, default: int = 0) -> int:
+    try:
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_import_account(raw: dict) -> Account:
+    if not isinstance(raw, dict):
+        raise ValueError("Each imported account must be an object")
+
+    email = str(raw.get("email", "") or "").strip()
+    token = str(raw.get("token", "") or "").strip()
+
+    if not email:
+        raise ValueError("Each imported account must include email")
+    if not token:
+        raise ValueError(f"Imported account {email} is missing token")
+
+    return Account(
+        email=email,
+        password=str(raw.get("password", "") or ""),
+        token=token,
+        cookies=str(raw.get("cookies", "") or ""),
+        username=str(raw.get("username", "") or ""),
+        activation_pending=bool(raw.get("activation_pending", False)),
+        status_code=str(raw.get("status_code", "") or ""),
+        last_error=str(raw.get("last_error", "") or ""),
+        valid=bool(raw.get("valid", raw.get("is_valid", True))),
+        rate_limited_until=_coerce_float(raw.get("rate_limited_until", 0.0)),
+        last_request_started=_coerce_float(raw.get("last_request_started", 0.0)),
+        last_request_finished=_coerce_float(raw.get("last_request_finished", 0.0)),
+        consecutive_failures=_coerce_int(raw.get("consecutive_failures", 0)),
+        rate_limit_strikes=_coerce_int(raw.get("rate_limit_strikes", 0)),
+    )
+
+
+def parse_account_import_payload(payload) -> list[Account]:
+    if isinstance(payload, dict):
+        rows = payload.get("accounts")
+    elif isinstance(payload, list):
+        rows = payload
+    else:
+        raise ValueError("Import payload must be a JSON array or an object with an accounts field")
+
+    if not isinstance(rows, list):
+        raise ValueError("Import payload must contain an accounts array")
+
+    deduped: dict[str, Account] = {}
+    for raw in rows:
+        account = _build_import_account(raw)
+        deduped[account.email] = account
+    return list(deduped.values())
 
 
 @router.get("/status", dependencies=[Depends(verify_admin)])
@@ -170,6 +249,51 @@ async def list_accounts(request: Request):
     return {"accounts": accounts}
 
 
+@router.get("/accounts/export", dependencies=[Depends(verify_admin)])
+async def export_accounts(request: Request):
+    pool: AccountPool = request.app.state.account_pool
+    payload = build_account_export_payload(pool.accounts)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return JSONResponse(
+        content=payload,
+        headers={"Content-Disposition": f'attachment; filename="accounts-export-{timestamp}.json"'},
+    )
+
+
+@router.post("/accounts/import", dependencies=[Depends(verify_admin)])
+async def import_accounts(request: Request):
+    pool: AccountPool = request.app.state.account_pool
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    try:
+        imported_accounts = parse_account_import_payload(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if not imported_accounts:
+        raise HTTPException(status_code=400, detail="No accounts found in import payload")
+
+    async with pool._lock:
+        existing_by_email = {account.email: account for account in pool.accounts}
+        replaced = sum(1 for account in imported_accounts if account.email in existing_by_email)
+        for account in imported_accounts:
+            existing_by_email[account.email] = account
+        pool.accounts = list(existing_by_email.values())
+
+    await pool.save()
+    wake_auto_refill_task(request)
+    return {
+        "ok": True,
+        "imported": len(imported_accounts),
+        "replaced": replaced,
+        "total": len(pool.accounts),
+    }
+
+
 @router.post("/accounts/generate", dependencies=[Depends(verify_admin)])
 async def generate_accounts(req: GenerateAccountsRequest, request: Request):
     """Generate N new accounts automatically via TempMail and Qwen Registration."""
@@ -197,98 +321,6 @@ async def generate_accounts(req: GenerateAccountsRequest, request: Request):
         "emails": results,
         "errors": errors
     }
-
-
-@router.post("/accounts/register-verify", dependencies=[Depends(verify_admin)])
-async def verify_register_secret(request: Request):
-    """验证注册解锁密码，正确则前端显示一键注册按钮。"""
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(400, "Invalid JSON")
-    secret = body.get("secret", "")
-    expected = settings.REGISTER_SECRET
-    if not expected:
-        return {"ok": False, "error": "register secret not configured"}
-    return {"ok": (secret == expected)}
-
-
-@router.post("/accounts/register", dependencies=[Depends(verify_admin)])
-async def register_new_account(request: Request):
-    import logging
-    from backend.core.config import resolve_model
-    from backend.services.auth_resolver import activate_account as activate_logic, register_qwen_account
-    from backend.services.qwen_client import QwenClient
-
-    pool: AccountPool = request.app.state.account_pool
-    client: QwenClient = request.app.state.qwen_client
-    log = logging.getLogger("backend.api.admin")
-
-    client_ip = request.client.host if request.client else "127.0.0.1"
-    log.info(f"[??] ?????????? IP?{client_ip}")
-
-    if len(pool.accounts) >= 100:
-        return {"ok": False, "error": "??????????????"}
-
-    try:
-        acc = await register_qwen_account()
-        if not acc:
-            return {"ok": False, "error": "??????????????????"}
-
-        activated_during_register = False
-        readiness_error = ""
-        chat_id = None
-        try:
-            chat_id = await client.create_chat(acc.token, resolve_model("qwen"))
-        except Exception as e:
-            readiness_error = str(e)
-        finally:
-            if chat_id:
-                try:
-                    await client.delete_chat(acc.token, chat_id)
-                except Exception:
-                    pass
-
-        if readiness_error:
-            err_lower = readiness_error.lower()
-            if any(k in err_lower for k in ("pending activation", "please check your email", "not activated")):
-                log.warning(f"[Register] {acc.email} registered but not ready yet: {readiness_error}")
-                acc.valid = False
-                acc.activation_pending = True
-                acc.status_code = "pending_activation"
-                acc.last_error = "???????????"
-                activated_during_register = await activate_logic(acc)
-                if not activated_during_register:
-                    await pool.add(acc)
-                    log.info(f"[Register] Pending account added to pool for manual activation: {acc.email}")
-                    return {
-                        "ok": True,
-                        "email": acc.email,
-                        "activation_pending": True,
-                        "message": "???????????",
-                        "error": acc.last_error,
-                    }
-            elif any(k in err_lower for k in ("unauthorized", "forbidden", "401", "403", "token", "login")):
-                log.warning(f"[Register] {acc.email} rejected by upstream right after registration: {readiness_error}")
-                return {
-                    "ok": False,
-                    "email": acc.email,
-                    "error": "???????????????????????",
-                }
-            else:
-                log.warning(f"[Register] readiness check skipped for {acc.email}: {readiness_error}")
-
-        acc.valid = True
-        acc.activation_pending = False
-        acc.status_code = "valid"
-        acc.last_error = ""
-        await pool.add(acc)
-        message = "?????????????"
-        if activated_during_register:
-            message = "??????????????????"
-        return {"ok": True, "email": acc.email, "message": message}
-    except Exception as e:
-        return {"ok": False, "error": f"????: {str(e)}"}
 
 
 @router.post("/verify", dependencies=[Depends(verify_admin)])
@@ -442,6 +474,7 @@ async def get_settings():
     return {
         "version": "2.0.0",
         "max_inflight_per_account": backend_settings.MAX_INFLIGHT_PER_ACCOUNT,
+        "auto_refill_target_min_accounts": backend_settings.AUTO_REFILL_TARGET_MIN_ACCOUNTS,
         "engine_mode": backend_settings.ENGINE_MODE,
         "model_aliases": {k: v for k, v in MODEL_MAP.items()},
     }
@@ -453,12 +486,16 @@ async def update_settings(data: dict, request: Request):
     if "max_inflight_per_account" in data:
         value = int(data["max_inflight_per_account"])
         settings.MAX_INFLIGHT_PER_ACCOUNT = value
-        request.app.state.account_pool.max_inflight = value
+        request.app.state.account_pool.set_max_inflight(value)
+    if "auto_refill_target_min_accounts" in data:
+        settings.AUTO_REFILL_TARGET_MIN_ACCOUNTS = max(0, int(data["auto_refill_target_min_accounts"]))
     if "engine_mode" in data and data["engine_mode"] in ("httpx", "browser", "hybrid"):
         settings.ENGINE_MODE = data["engine_mode"]
     if "model_aliases" in data:
         MODEL_MAP.clear()
         MODEL_MAP.update(data["model_aliases"])
+    save_runtime_config()
+    wake_auto_refill_task(request)
     return {"ok": True}
 
 

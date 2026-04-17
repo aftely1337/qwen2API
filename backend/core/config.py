@@ -12,7 +12,6 @@ class Settings(BaseSettings):
     PORT: int = int(os.getenv("PORT", 7860))
     WORKERS: int = int(os.getenv("WORKERS", 3))
     ADMIN_KEY: str = os.getenv("ADMIN_KEY", "admin")
-    REGISTER_SECRET: str = os.getenv("REGISTER_SECRET", "")
 
     # 引擎模式：httpx（快速直连）、browser（浏览器指纹，防封）或 hybrid（混合）
     ENGINE_MODE: str = os.getenv("ENGINE_MODE", "httpx")
@@ -20,6 +19,7 @@ class Settings(BaseSettings):
     # 浏览器引擎配置
     BROWSER_POOL_SIZE: int = int(os.getenv("BROWSER_POOL_SIZE", 2))
     MAX_INFLIGHT_PER_ACCOUNT: int = int(os.getenv("MAX_INFLIGHT", 1))
+    AUTO_REFILL_TARGET_MIN_ACCOUNTS: int = int(os.getenv("AUTO_REFILL_TARGET_MIN_ACCOUNTS", os.getenv("AUTO_REFILL_TARGET", 3)))
     STREAM_KEEPALIVE_INTERVAL: int = int(os.getenv("STREAM_KEEPALIVE_INTERVAL", 5))
 
     # 容灾与限流
@@ -110,6 +110,63 @@ MODEL_MAP = {
 
 # 图片生成沿用网页当前真实可用的基础模型，不再写死 wanx 模型名
 IMAGE_MODEL_DEFAULT = "qwen3.6-plus"
+
+
+def load_runtime_config() -> dict:
+    path = Path(settings.CONFIG_FILE)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def apply_runtime_config(data: dict):
+    if not isinstance(data, dict):
+        return
+
+    try:
+        if "max_inflight_per_account" in data:
+            settings.MAX_INFLIGHT_PER_ACCOUNT = max(1, int(data["max_inflight_per_account"]))
+    except (TypeError, ValueError):
+        pass
+
+    engine_mode = str(data.get("engine_mode", "") or "").strip().lower()
+    if engine_mode in {"httpx", "browser", "hybrid"}:
+        settings.ENGINE_MODE = engine_mode
+
+    try:
+        if "auto_refill_target_min_accounts" in data:
+            settings.AUTO_REFILL_TARGET_MIN_ACCOUNTS = max(0, int(data["auto_refill_target_min_accounts"]))
+    except (TypeError, ValueError):
+        pass
+
+    aliases = data.get("model_aliases")
+    if isinstance(aliases, dict):
+        MODEL_MAP.clear()
+        MODEL_MAP.update({str(key): str(value) for key, value in aliases.items()})
+
+
+def build_runtime_config_payload() -> dict:
+    return {
+        "max_inflight_per_account": int(settings.MAX_INFLIGHT_PER_ACCOUNT),
+        "engine_mode": str(settings.ENGINE_MODE),
+        "auto_refill_target_min_accounts": int(settings.AUTO_REFILL_TARGET_MIN_ACCOUNTS),
+        "model_aliases": {key: value for key, value in MODEL_MAP.items()},
+    }
+
+
+def save_runtime_config():
+    path = Path(settings.CONFIG_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = build_runtime_config_payload()
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+apply_runtime_config(load_runtime_config())
+
 
 def resolve_model(name: str) -> str:
     return MODEL_MAP.get(name, name)

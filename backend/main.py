@@ -23,6 +23,7 @@ from backend.core.httpx_engine import HttpxEngine
 from backend.core.hybrid_engine import HybridEngine
 from backend.core.account_pool import AccountPool
 from backend.services.qwen_client import QwenClient
+from backend.services.account_health import count_healthy_accounts
 from backend.services.auto_registrar import QwenAutoRegistrar
 from backend.api import admin, v1_chat, probes, anthropic, gemini, embeddings, images
 from backend.services.garbage_collector import garbage_collect_chats
@@ -30,39 +31,55 @@ from backend.services.garbage_collector import garbage_collect_chats
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("qwen2api")
 
-async def background_auto_refill_task(pool):
-    TARGET_MIN_ACCOUNTS = 3
+
+async def sleep_or_wake(delay_seconds: float, wake_event: asyncio.Event | None = None):
+    if delay_seconds <= 0:
+        return
+    if wake_event is None:
+        await asyncio.sleep(delay_seconds)
+        return
+    try:
+        await asyncio.wait_for(wake_event.wait(), timeout=delay_seconds)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        wake_event.clear()
+
+
+async def background_auto_refill_task(pool, wake_event: asyncio.Event | None = None):
     registrar = QwenAutoRegistrar()
     
     while True:
         try:
+            target_min_accounts = max(0, int(getattr(settings, "AUTO_REFILL_TARGET_MIN_ACCOUNTS", 3) or 0))
+            if target_min_accounts <= 0:
+                await sleep_or_wake(300, wake_event)
+                continue
+
             # Count healthy accounts (status=200, not rate limited)
-            healthy_count = sum(
-                1 for acc in pool.accounts 
-                if acc.status_code == 200 and not acc.is_rate_limited()
-            )
+            healthy_count = count_healthy_accounts(pool.accounts)
             
-            if healthy_count < TARGET_MIN_ACCOUNTS:
-                log.info(f"[Daemon] Healthy accounts ({healthy_count}) < target ({TARGET_MIN_ACCOUNTS}). Starting auto-refill...")
+            if healthy_count < target_min_accounts:
+                log.info(f"[Daemon] Healthy accounts ({healthy_count}) < target ({target_min_accounts}). Starting auto-refill...")
                 try:
                     new_acc = await registrar.register_account()
                     await pool.add(new_acc)
                     log.info(f"[Daemon] Auto-refill successful. Added {new_acc.email}.")
                     # Wait a bit before registering another one to avoid suspicion
-                    await asyncio.sleep(10)
+                    await sleep_or_wake(10, wake_event)
                 except Exception as e:
                     log.error(f"[Daemon] Auto-refill failed: {e}. Backing off for 5 minutes.")
-                    await asyncio.sleep(300) # 5 minutes backoff on failure
+                    await sleep_or_wake(300, wake_event) # 5 minutes backoff on failure
             else:
                 # Pool is healthy, check again in 5 minutes
-                await asyncio.sleep(300)
+                await sleep_or_wake(300, wake_event)
                 
         except asyncio.CancelledError:
             log.info("[Daemon] Auto-refill task cancelled.")
             break
         except Exception as e:
             log.error(f"[Daemon] Unexpected error in auto-refill task: {e}")
-            await asyncio.sleep(60)
+            await sleep_or_wake(60, wake_event)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -97,7 +114,8 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(garbage_collect_chats(app.state.qwen_client))
     
     # Start daemon
-    refill_task = asyncio.create_task(background_auto_refill_task(app.state.account_pool))
+    app.state.auto_refill_wakeup = asyncio.Event()
+    refill_task = asyncio.create_task(background_auto_refill_task(app.state.account_pool, app.state.auto_refill_wakeup))
 
     yield
 
