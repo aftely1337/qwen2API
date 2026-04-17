@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react"
 import { Button } from "../components/ui/button"
-import { Trash2, Plus, RefreshCw, Bot, ShieldCheck, MailWarning } from "lucide-react"
+import { Trash2, Plus, RefreshCw, ShieldCheck, MailWarning, Loader2, Zap, Download, Upload } from "lucide-react"
 import { toast } from "sonner"
 import { getAuthHeader } from "../lib/auth"
 import { API_BASE } from "../lib/api"
@@ -64,28 +64,129 @@ function localizeError(error?: string) {
   return error
 }
 
-// SHA-256("yangAdmin::A15935700a@") — one-way hash, credentials not recoverable from source
-const _UH = "29bb93e7473e47595a454ea0c7996f659035bc5298faf820039fbf7641906aea"
 
 export default function AccountsPage() {
   const [accounts, setAccounts] = useState<AccountItem[]>([])
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
   const [token, setToken] = useState("")
-  const [registering, setRegistering] = useState(false)
-  const [registerUnlocked, setRegisterUnlocked] = useState(false)
   const [verifying, setVerifying] = useState<string | null>(null)
   const [verifyingAll, setVerifyingAll] = useState(false)
 
-  // 邮箱+密码字段同时匹配时解锁注册功能
-  useEffect(() => {
-    if (!email || !password) return
-    crypto.subtle.digest("SHA-256", new TextEncoder().encode(email + "::" + password))
-      .then(buf => {
-        const hex = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("")
-        if (hex === _UH) setRegisterUnlocked(true)
+  const [isGenerating, setIsGenerating] = useState(false)
+  const [generateCount, setGenerateCount] = useState(1)
+  const [showGenerateModal, setShowGenerateModal] = useState(false)
+  const [isExporting, setIsExporting] = useState(false)
+  const [isImporting, setIsImporting] = useState(false)
+  const importFileRef = useRef<HTMLInputElement | null>(null)
+
+  const handleGenerate = async () => {
+    setIsGenerating(true)
+    const id = toast.loading("\u6b63\u5728\u751f\u6210\u8d26\u53f7...")
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/accounts/generate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...getAuthHeader()
+        },
+        body: JSON.stringify({ count: generateCount })
       })
-  }, [email, password])
+      
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.detail || "\u751f\u6210\u8d26\u53f7\u5931\u8d25")
+      
+      toast.success(`\u6210\u529f\u751f\u6210\u4e86 ${data.success_count} \u4e2a\u8d26\u53f7\u3002`, { id, duration: 8000 })
+      setShowGenerateModal(false)
+      fetchAccounts() // Refresh the table
+    } catch (err: unknown) {
+      toast.error(err instanceof Error ? err.message : String(err), { id, duration: 8000 })
+    } finally {
+      setIsGenerating(false)
+    }
+  }
+
+  const handleExport = async () => {
+    setIsExporting(true)
+    const id = toast.loading("正在导出账号...")
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/accounts/export`, {
+        headers: getAuthHeader(),
+      })
+
+      if (!res.ok) {
+        let message = "导出账号失败"
+        try {
+          const data = await res.json()
+          message = data.detail || message
+        } catch {
+          // ignore non-json error bodies
+        }
+        throw new Error(message)
+      }
+
+      const blob = await res.blob()
+      const disposition = res.headers.get("Content-Disposition") || ""
+      const matched = disposition.match(/filename=\"?([^"]+)\"?/)
+      const filename = matched?.[1] || `accounts-export-${Date.now()}.json`
+      const downloadUrl = URL.createObjectURL(blob)
+      const anchor = document.createElement("a")
+      anchor.href = downloadUrl
+      anchor.download = filename
+      document.body.appendChild(anchor)
+      anchor.click()
+      document.body.removeChild(anchor)
+      URL.revokeObjectURL(downloadUrl)
+      toast.success("账号已导出", { id })
+    } catch (err: unknown) {
+      toast.error(err instanceof Error ? err.message : String(err), { id, duration: 8000 })
+    } finally {
+      setIsExporting(false)
+    }
+  }
+
+  const handleOpenImport = () => {
+    importFileRef.current?.click()
+  }
+
+  const handleImportFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+
+    setIsImporting(true)
+    const id = toast.loading(`正在导入账号：${file.name}`)
+    try {
+      const raw = await file.text()
+      const payload = JSON.parse(raw)
+
+      const res = await fetch(`${API_BASE}/api/admin/accounts/import`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...getAuthHeader(),
+        },
+        body: JSON.stringify(payload),
+      })
+
+      const data = await res.json()
+      if (!res.ok) {
+        throw new Error(data.detail || "导入账号失败")
+      }
+
+      toast.success(`成功导入 ${data.imported} 个账号，覆盖 ${data.replaced} 个。`, { id, duration: 8000 })
+      fetchAccounts()
+    } catch (err: unknown) {
+      if (err instanceof SyntaxError) {
+        toast.error("导入文件不是有效的 JSON", { id, duration: 8000 })
+      } else {
+        toast.error(err instanceof Error ? err.message : String(err), { id, duration: 8000 })
+      }
+    } finally {
+      event.target.value = ""
+      setIsImporting(false)
+    }
+  }
+
 
   const fetchAccounts = () => {
     fetch(`${API_BASE}/api/admin/accounts`, { headers: getAuthHeader() })
@@ -94,7 +195,7 @@ export default function AccountsPage() {
         return res.json()
       })
       .then(data => setAccounts(data.accounts || []))
-      .catch(() => toast.error("\u5237\u65b0\u8d26\u53f7\u5217\u8868\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5\u4f1a\u8bdd\u5bc6\u94a5"))
+      .catch(() => toast.error("刷新账号列表失败，请检查右下角的管理 Key"))
   }
 
   useEffect(() => {
@@ -154,29 +255,6 @@ export default function AccountsPage() {
       toast.success(`\u5df2\u5220\u9664 ${targetEmail}`, { id })
       fetchAccounts()
     }).catch(() => toast.error("\u5220\u9664\u8d26\u53f7\u5931\u8d25", { id }))
-  }
-
-  const handleAutoRegister = () => {
-    setRegistering(true)
-    const id = toast.loading("\u6b63\u5728\u81ea\u52a8\u6ce8\u518c\u65b0\u8d26\u53f7\uff0c\u8bf7\u7a0d\u5019...")
-    fetch(`${API_BASE}/api/admin/accounts/register`, {
-      method: "POST",
-      headers: getAuthHeader(),
-    }).then(res => res.json())
-      .then(data => {
-        if (data.activation_pending) {
-          toast.warning(`\u8d26\u53f7\u5df2\u6ce8\u518c\uff0c\u4f46\u4ecd\u9700\u6fc0\u6d3b\uff1a${data.email}`, { id, duration: 8000 })
-          fetchAccounts()
-        } else if (data.ok) {
-          toast.success(data.message || `\u6ce8\u518c\u6210\u529f\uff1a${data.email}`, { id, duration: 8000 })
-          fetchAccounts()
-        } else {
-          toast.error(localizeError(data.error) || "\u81ea\u52a8\u6ce8\u518c\u5931\u8d25", { id, duration: 8000 })
-          if (data.email) fetchAccounts()
-        }
-      })
-      .catch(() => toast.error("\u81ea\u52a8\u6ce8\u518c\u8bf7\u6c42\u5931\u8d25", { id }))
-      .finally(() => setRegistering(false))
   }
 
   const handleVerify = (targetEmail: string) => {
@@ -243,19 +321,31 @@ export default function AccountsPage() {
           <h2 className="text-3xl font-extrabold tracking-tight">{"\u8d26\u53f7\u7ba1\u7406"}</h2>
           <p className="text-muted-foreground mt-1">{"\u7edf\u4e00\u7ba1\u7406\u4e0a\u6e38\u8d26\u53f7\u6c60\uff0c\u5e76\u533a\u5206\u672a\u6fc0\u6d3b\u3001\u9650\u6d41\u3001\u5c01\u7981\u4e0e\u5931\u6548\u72b6\u6001\u3002"}</p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2 justify-end">
+          <input
+            ref={importFileRef}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            onChange={handleImportFile}
+          />
+          <Button variant="outline" onClick={handleExport} disabled={isExporting}>
+            {isExporting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Download className="mr-2 h-4 w-4" />}
+            {"导出账号"}
+          </Button>
+          <Button variant="outline" onClick={handleOpenImport} disabled={isImporting}>
+            {isImporting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Upload className="mr-2 h-4 w-4" />}
+            {"导入账号"}
+          </Button>
           <Button variant="secondary" onClick={handleVerifyAll} disabled={verifyingAll}>
             <ShieldCheck className={`mr-2 h-4 w-4 ${verifyingAll ? 'animate-pulse' : ''}`} /> {"\u5168\u91cf\u5de1\u68c0"}
           </Button>
           <Button variant="outline" onClick={() => { fetchAccounts(); toast.success("\u8d26\u53f7\u5217\u8868\u5df2\u5237\u65b0") }}>
             <RefreshCw className="mr-2 h-4 w-4" /> {"\u5237\u65b0\u72b6\u6001"}
           </Button>
-          {registerUnlocked && (
-            <Button variant="default" onClick={handleAutoRegister} disabled={registering}>
-              {registering ? <RefreshCw className="mr-2 h-4 w-4 animate-spin" /> : <Bot className="mr-2 h-4 w-4" />}
-              {registering ? "\u6b63\u5728\u6ce8\u518c..." : "\u4e00\u952e\u83b7\u53d6\u65b0\u53f7"}
-            </Button>
-          )}
+          <Button className="bg-purple-600 hover:bg-purple-700 text-white" onClick={() => setShowGenerateModal(true)}>
+            <Zap className="mr-2 h-4 w-4" /> {"\u81ea\u52a8\u751f\u6210"}
+          </Button>
         </div>
       </div>
 
@@ -270,16 +360,12 @@ export default function AccountsPage() {
       <div className="rounded-2xl border bg-card/40 p-6 space-y-4">
         <div>
           <h3 className="text-base font-bold">{"\u624b\u52a8\u6ce8\u5165\u8d26\u53f7"}</h3>
-          <p className="text-sm text-muted-foreground">{"\u8bf7\u5148\u5728 chat.qwen.ai \u767b\u5f55\uff0c\u7136\u540e\u6309 F12 \u6253\u5f00\u5f00\u53d1\u8005\u5de5\u5177\uff0c\u5728 Application / Storage \u91cc\u7684 Local Storage / \u672c\u5730\u5b58\u50a8 \u4e2d\u627e\u5230 token \u5e76\u76f4\u63a5\u590d\u5236\u5b8c\u6574\u539f\u59cb\u503c\u7c98\u8d34\u5230\u4e0b\u65b9\u8f93\u5165\u6846\u3002"}</p>
-          <div className="rounded-xl border border-orange-500/30 bg-orange-500/10 p-3 mt-3">
-            <p className="text-sm font-semibold text-orange-700 dark:text-orange-300">{"\u91cd\u8981\uff1a\u8bf7\u53ea\u7c98\u8d34 Local Storage / \u672c\u5730\u5b58\u50a8 \u91cc\u7684 token \u539f\u59cb\u503c\uff0c\u4e0d\u8981\u4ece Network \u8bf7\u6c42\u6216 Authorization \u8bf7\u6c42\u5934\u4e2d\u63d0\u53d6\u3002"}</p>
-            <p className="text-xs text-orange-700/80 dark:text-orange-200/80 mt-1">{"\u8bf7\u4e0d\u8981\u5e26 Bearer \u524d\u7f00\uff0c\u4e5f\u4e0d\u8981\u7c98\u8d34\u6574\u6bb5 Authorization \u6587\u672c\u3002\u90ae\u7bb1\u548c\u5bc6\u7801\u53ef\u4ee5\u4e0d\u586b\uff0c\u7cfb\u7edf\u4f1a\u5728\u6ce8\u5165\u524d\u5148\u9a8c\u8bc1 token \u662f\u5426\u6709\u6548\u3002"}</p>
-          </div>
+          <p className="text-sm text-muted-foreground">{"\u5982\u679c\u4f60\u5df2\u7ecf\u5728 chat.qwen.ai \u767b\u5f55\u8fc7\uff0c\u53ef\u4ee5\u628a token \u624b\u52a8\u6ce8\u5165\u5230\u8d26\u53f7\u6c60\u3002"}</p>
         </div>
         <div className="flex flex-col md:flex-row gap-4 items-end">
           <div className="flex-1 w-full">
             <label className="text-xs font-semibold mb-1.5 block">{"Token\uff08\u5fc5\u586b\uff09"}</label>
-            <input type="text" value={token} onChange={e => setToken(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder={"\u7c98\u8d34\u4ece Local Storage / \u672c\u5730\u5b58\u50a8 \u76f4\u63a5\u590d\u5236\u7684 token"} />
+            <input type="text" value={token} onChange={e => setToken(e.target.value)} className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" placeholder={"\u7c98\u8d34 token"} />
           </div>
           <div className="w-full md:w-64">
             <label className="text-xs font-semibold mb-1.5 block">{"\u90ae\u7bb1\uff08\u9009\u586b\uff09"}</label>
@@ -313,7 +399,7 @@ export default function AccountsPage() {
           <tbody className="divide-y divide-border/50">
             {accounts.length === 0 && (
               <tr>
-                <td colSpan={5} className="px-6 py-12 text-center text-muted-foreground">{"\u6682\u65e0\u8d26\u53f7\uff0c\u8bf7\u624b\u52a8\u6ce8\u5165\u6216\u4e00\u952e\u83b7\u53d6\u65b0\u53f7\u3002"}</td>
+                <td colSpan={5} className="px-6 py-12 text-center text-muted-foreground">{"\u6682\u65e0\u8d26\u53f7\uff0c\u8bf7\u624b\u52a8\u6ce8\u5165\u6216\u81ea\u52a8\u751f\u6210\u8d26\u53f7\u3002"}</td>
               </tr>
             )}
             {accounts.map(acc => (
@@ -352,6 +438,48 @@ export default function AccountsPage() {
           </tbody>
         </table>
       </div>
+
+      {showGenerateModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-zinc-900 rounded-lg p-6 w-full max-w-md">
+            <h3 className="text-xl font-semibold mb-4">{"\u81ea\u52a8\u751f\u6210\u8d26\u53f7"}</h3>
+            <p className="text-muted-foreground mb-4 text-sm">
+              {"\u5c06\u4f7f\u7528 tempmail.lol \u81ea\u52a8\u6ce8\u518c\u65b0\u7684 Qwen \u8d26\u53f7\u5e76\u6dfb\u52a0\u5230\u8d26\u53f7\u6c60\u3002"}
+            </p>
+            
+            <div className="mb-4">
+              <label className="block text-sm font-medium mb-1">{"\u751f\u6210\u6570\u91cf"}</label>
+              <input
+                type="number"
+                min="1"
+                max="10"
+                value={generateCount}
+                onChange={(e) => setGenerateCount(parseInt(e.target.value) || 1)}
+                className="w-full px-3 py-2 border border-input bg-background rounded-md"
+                disabled={isGenerating}
+              />
+            </div>
+
+            <div className="flex justify-end space-x-3 mt-6">
+              <Button
+                variant="outline"
+                onClick={() => setShowGenerateModal(false)}
+                disabled={isGenerating}
+              >
+                {"\u53d6\u6d88"}
+              </Button>
+              <Button
+                onClick={handleGenerate}
+                disabled={isGenerating}
+                className="bg-purple-600 hover:bg-purple-700 text-white"
+              >
+                {isGenerating ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
+                {isGenerating ? "\u751f\u6210\u4e2d..." : "\u5f00\u59cb\u751f\u6210"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

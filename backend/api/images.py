@@ -9,6 +9,7 @@ import time
 import json
 import asyncio
 import logging
+from math import gcd
 from fastapi import APIRouter, Request, HTTPException, File, UploadFile, Form
 from fastapi.responses import JSONResponse
 from backend.services.qwen_client import QwenClient
@@ -63,12 +64,23 @@ def _get_token(request: Request) -> str:
     return request.headers.get("x-api-key", "").strip()
 
 
-def _build_image_prompt(prompt: str) -> str:
-    return (
-        "请直接生成图片，不要只输出文字描述。"
-        "如果可以生成图片，请返回可访问的图片链接或包含图片链接的结果。\n\n"
-        f"用户需求：{prompt}"
-    )
+def _normalize_qwen_image_size(size: str | None) -> str:
+    raw = (size or "").strip().lower()
+    if not raw:
+        return "1:1"
+    if re.fullmatch(r"\d+:\d+", raw):
+        return raw
+
+    match = re.fullmatch(r"(\d+)\s*x\s*(\d+)", raw)
+    if not match:
+        return "1:1"
+
+    width = int(match.group(1))
+    height = int(match.group(2))
+    if width <= 0 or height <= 0:
+        return "1:1"
+    divisor = gcd(width, height) or 1
+    return f"{width // divisor}:{height // divisor}"
 
 
 @router.post("/v1/images/generations")
@@ -93,6 +105,7 @@ async def create_image(request: Request):
         raise HTTPException(400, "prompt is required")
 
     n: int = min(max(int(body.get("n", 1)), 1), 4)
+    qwen_size = _normalize_qwen_image_size(body.get("size"))
     model = _resolve_image_model(body.get("model"))
 
     log.info(f"[T2I] model={model}, n={n}, prompt={prompt[:80]!r}")
@@ -100,9 +113,15 @@ async def create_image(request: Request):
     acc = None
     chat_id = None
     try:
-        prompt_text = _build_image_prompt(prompt)
+        prompt_text = prompt.strip()
         event_payloads: list[str] = []
-        async for item in client.chat_stream_events_with_retry(model, prompt_text, has_custom_tools=False):
+        async for item in client.chat_stream_events_with_retry(
+            model,
+            prompt_text,
+            has_custom_tools=False,
+            chat_type="t2i",
+            size=qwen_size,
+        ):
             if item.get("type") == "meta":
                 acc = item.get("acc")
                 chat_id = item.get("chat_id")
@@ -171,6 +190,7 @@ async def edit_image(
 
     n_limit = min(max(n, 1), 4)
     model_resolved = _resolve_image_model(model)
+    qwen_size = _normalize_qwen_image_size(size)
     log.info(f"[T2I-Edit] model={model_resolved}, n={n_limit}, prompt={prompt[:80]!r}")
 
     image_bytes = await image.read()
@@ -192,7 +212,7 @@ async def edit_image(
             remote_info = await uploader.upload_local_file(acc, local_meta)
             remote_ref = remote_info["remote_ref"]
 
-            prompt_text = _build_image_prompt(prompt)
+            prompt_text = prompt.strip()
             event_payloads: list[str] = []
             chat_id = None
 
@@ -202,7 +222,8 @@ async def edit_image(
                 has_custom_tools=False,
                 files=[remote_ref],
                 fixed_account=acc,
-                chat_type="image_edit"
+                chat_type="t2i",
+                size=qwen_size,
             ):
                 if item.get("type") == "meta":
                     chat_id = item.get("chat_id")

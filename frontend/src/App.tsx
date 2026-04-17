@@ -7,6 +7,7 @@ import TestPage from "./pages/TestPage"
 import TokensPage from "./pages/TokensPage"
 import SettingsPage from "./pages/SettingsPage"
 import ImagePage from "./pages/ImagePage"
+import ImageEditPage from "./pages/ImageEditPage"
 
 function App() {
   return (
@@ -20,6 +21,7 @@ function App() {
             <Route path="tokens" element={<TokensPage />} />
             <Route path="test" element={<TestPage />} />
             <Route path="images" element={<ImagePage />} />
+            <Route path="images/edit" element={<ImageEditPage />} />
             <Route path="settings" element={<SettingsPage />} />
           </Route>
         </Routes>
